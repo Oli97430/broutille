@@ -1,0 +1,4 @@
+# cmd.exe tronque les lignes d'un .bat en LF : installer.bat doit rester en CRLF, même téléchargé en ZIP
+*.bat text eol=crlf
+*.npz binary
+*.stl binary
