@@ -111,10 +111,12 @@ Choisissez `Webcam 0`, ou `Webcam 1` si le PC a déjà une caméra intégrée.
 
 **Le cadrage est important** : il retire boutons, horloges et autres caméras de la mosaïque, et la tortue y gagne en taille.
 
+**Bandes unies retirées seules** : quand le logiciel n'affiche la caméra que dans une partie de sa fenêtre (EZVIZ Studio montre une caméra verticale dans une tuile étroite, le reste en gris), Broutille enlève le fond uni autour. Les clips et les photos ne gardent que l'image de la caméra. Le cadre est recalculé toutes les 5 s. **⛶ Cadrer** s'applique ensuite dans cette image.
+
 Règles :
 
 - La fenêtre doit rester ouverte, pas réduite dans la barre des tâches.
-- Elle peut en général être cachée par une autre. Si l'image reste noire, gardez-la visible à l'écran.
+- Elle peut en général être cachée par une autre. Mais certains lecteurs, dont EZVIZ Studio, ne se capturent qu'à l'écran : il faut alors **les laisser visibles, sans rien par-dessus**, pas même la fenêtre de Broutille. Si une fenêtre les couvre, Broutille s'arrête de capturer plutôt que d'enregistrer la fenêtre du dessus.
 - La capture se fait à 10 images par seconde : suffisant pour des tortues.
 - Une fenêtre affiche souvent une image réduite : mettez-la en grand, ou en plein écran si votre logiciel le permet.
 
@@ -288,7 +290,7 @@ Le ménage ne touche jamais au journal ni aux galeries des tortues.
 |---|---|---|
 | « La source vidéo ne renvoie aucune image » | webcam prise par une autre application, ou accès refusé | fermer Teams ou Zoom ; Paramètres › Confidentialité › Caméra |
 | Webcam introuvable | mauvais numéro | essayer `Webcam 1`, `Webcam 2` |
-| Fenêtre : image noire | lecteur vidéo non capturable en arrière-plan | garder la fenêtre visible à l'écran |
+| Fenêtre : image noire, ou « aucune image » | lecteur capturable seulement à l’écran, fenêtre cachée | garder la fenêtre visible, sans rien par-dessus (Broutille à côté, pas devant) |
 | Fenêtre : « Source interrompue » | fenêtre réduite ou fermée | la rouvrir : Broutille reprend seul |
 | Flux : aucune image | adresse fausse, mot de passe, RTSP désactivé | tester l'adresse dans VLC |
 | Tortue pas détectée | trop petite, trop sombre | rapprocher la caméra, cadrer, améliorer la lumière |

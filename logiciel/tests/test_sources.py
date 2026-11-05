@@ -69,6 +69,31 @@ def essai_fenetre():
     return resultats
 
 
+def essai_bandes():
+    """Comme EZVIZ Studio : une vidéo verticale dans une tuile étroite, le reste de la fenêtre
+    en gris uni. La capture ne doit garder que la tuile."""
+    root = tk.Tk()
+    root.title("Broutille essai de bandes")
+    root.geometry("900x500+120+120")
+    root.configure(bg="#404040")
+    bruit = np.random.default_rng(1).integers(0, 256, (420, 260, 3), np.uint8)
+    entete = f"P6 {bruit.shape[1]} {bruit.shape[0]} 255 ".encode()
+    photo = tk.PhotoImage(data=entete + bruit[:, :, ::-1].tobytes(), format="PPM")
+    tk.Label(root, image=photo, bd=0, highlightthickness=0).place(x=30, y=40)
+    root.update()
+    time.sleep(0.5)
+    root.update()
+    camera, image = sources.ouvrir_source(sources.PREFIXE_FENETRE + "essai de bandes")
+    if camera is None:
+        root.destroy()
+        return [("bandes unies : fenêtre trouvée", False, "non")]
+    ok, image = camera.read()
+    camera.release()
+    root.destroy()
+    h, l = image.shape[:2] if ok else (0, 0)
+    return [("bandes unies enlevées", ok and abs(l - 260) <= 4 and abs(h - 420) <= 4, f"{l}x{h}, attendu 260x420")]
+
+
 def essai_flux():
     """Vidéo servie en HTTP local : même chemin qu'un flux Internet direct."""
     d = Path(tempfile.mkdtemp(prefix="broutille_flux_"))
@@ -107,7 +132,7 @@ def essai_page(adresse):
 
 def main():
     ok = True
-    resultats = essai_fenetre() + essai_flux()
+    resultats = essai_fenetre() + essai_bandes() + essai_flux()
     if len(sys.argv) > 1:
         resultats += essai_page(sys.argv[1])
     for nom, reussi, detail in resultats:

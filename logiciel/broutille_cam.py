@@ -898,8 +898,8 @@ class Surveillance:
                 ouverte = self.lecteur.pret.is_set() and not self.lecteur.echec
             if not ouverte:
                 if not self.arret.is_set():
-                    self.sur_message(f"La source vidéo ne renvoie aucune image : {masquer(self.source)} (fenêtre fermée ou "
-                                     "réduite, adresse fausse, caméra prise par une autre application, ou accès refusé "
+                    self.sur_message(f"La source vidéo ne renvoie aucune image : {masquer(self.source)} (fenêtre fermée, "
+                                     "réduite ou cachée par une autre fenêtre, adresse fausse, caméra prise par une autre application, ou accès refusé "
                                      "dans Paramètres › Confidentialité › Caméra)")
                 return False
             self._boucle(camera)

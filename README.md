@@ -100,7 +100,7 @@ Le dernier test compare une tortue inconnue à 2 à 10 fiches de 30 à 60 photos
 ## Limites connues
 
 - **Pas encore essayée sur de vraies tortues, ni avec une vraie webcam, ni avec EZVIZ Studio.** Les essais utilisent une vidéo simulée à partir de vraies photos, une fausse caméra, une vraie fenêtre de test et de vrais flux.
-- **Fenêtre** : le contenu de certains lecteurs vidéo n'est capturable que si la fenêtre reste visible à l'écran.
+- **Fenêtre** : le contenu de certains lecteurs vidéo, dont EZVIZ Studio, n'est capturable que si la fenêtre reste visible à l'écran, sans rien par-dessus. Les bandes unies autour de la vidéo sont retirées seules.
 - **Mot de passe RTSP** : masqué à l'écran, mais enregistré en clair dans `%USERPROFILE%\.broutille.json`.
 - **Vue libre** : une tortue vue sous un angle absent de sa galerie reste « Inconnue » tant qu'elle n'est pas confirmée. Le début d'utilisation demande donc quelques clics.
 - **Sulcata** : carapace moins dessinée que la radiata ; les bonnes conditions de lumière comptent davantage.
