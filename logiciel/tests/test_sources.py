@@ -21,6 +21,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import sources
 
 
+def ouvrir_en_animant(root, source):
+    """ouvrir_source observe la fenêtre plusieurs secondes : la boucle Tk doit tourner pendant
+    ce temps, sinon Windows remplace la fenêtre « ne répond pas » par un fantôme."""
+    resultat = {}
+    fil = threading.Thread(target=lambda: resultat.update(zip(("camera", "image"), sources.ouvrir_source(source))))
+    fil.start()
+    while fil.is_alive():
+        root.update()
+        time.sleep(0.05)
+    return resultat.get("camera"), resultat.get("image")
+
+
 def essai_fenetre():
     """Une fenêtre rouge puis cachée par une autre : la capture doit toujours voir le rouge."""
     root = tk.Tk()
@@ -32,7 +44,7 @@ def essai_fenetre():
     time.sleep(0.5)
     root.update()
     source = sources.PREFIXE_FENETRE + "essai de capture"
-    camera, image = sources.ouvrir_source(source)
+    camera, image = ouvrir_en_animant(root, source)
     resultats = []
     if camera is None:
         root.destroy()
@@ -63,7 +75,8 @@ def essai_fenetre():
     root.update()
     time.sleep(0.3)
     ok, image = camera.read()
-    resultats.append(("taille stable après redimensionnement", ok and image.shape[:2] == (360, 640), str(image.shape if ok else None)))
+    # la source suit la nouvelle taille ; la surveillance la remet au format du clip sans déformer
+    resultats.append(("redimensionnement suivi", ok and image.shape[:2] == (500, 800), str(image.shape if ok else None)))
     camera.release()
     root.destroy()
     return resultats
@@ -83,7 +96,7 @@ def essai_bandes():
     root.update()
     time.sleep(0.5)
     root.update()
-    camera, image = sources.ouvrir_source(sources.PREFIXE_FENETRE + "essai de bandes")
+    camera, image = ouvrir_en_animant(root, sources.PREFIXE_FENETRE + "essai de bandes")
     if camera is None:
         root.destroy()
         return [("bandes unies : fenêtre trouvée", False, "non")]
@@ -92,6 +105,59 @@ def essai_bandes():
     root.destroy()
     h, l = image.shape[:2] if ok else (0, 0)
     return [("bandes unies enlevées", ok and abs(l - 260) <= 4 and abs(h - 420) <= 4, f"{l}x{h}, attendu 260x420")]
+
+
+def essai_lecteur_cache():
+    """Comme EZVIZ Studio derrière d'autres fenêtres : une vidéo qui bouge au milieu d'une
+    interface fixe (boutons, liste). La fenêtre est cachée par une autre ; la capture doit
+    voir la vidéo et ne garder qu'elle."""
+    root = tk.Tk()
+    root.title("Broutille essai de lecteur")
+    root.geometry("900x600+150+150")
+    root.configure(bg="#f4f4f4")
+    for i, texte in enumerate(("Caméras", "Jardin", "Galerie", "Réglages")):
+        tk.Button(root, text=texte, width=14).place(x=10, y=20 + 40 * i)
+    tk.Label(root, text="caméra jardin", bg="#f4f4f4").place(x=200, y=10)
+    rng = np.random.default_rng(2)
+    fond = rng.integers(40, 200, (300, 480, 3), np.uint8)
+    video = tk.Label(root, bd=0, highlightthickness=0)
+    video.place(x=200, y=40)
+    cache = tk.Toplevel(root)
+    cache.title("fenêtre posée par-dessus")
+    cache.geometry("1000x700+100+100")
+    cache.configure(bg="#00c800")
+    cache.attributes("-topmost", True)
+
+    def image_suivante():
+        bruit = np.clip(fond.astype(np.int16) + rng.integers(-12, 13, fond.shape), 0, 255).astype(np.uint8)
+        photo = tk.PhotoImage(data=f"P6 480 300 255 ".encode() + bruit[:, :, ::-1].tobytes(), format="PPM")
+        video.configure(image=photo)
+        video.image = photo
+
+    image_suivante()
+    root.update()
+    time.sleep(0.3)
+    root.update()
+    resultat = {}
+    fil = threading.Thread(target=lambda: resultat.update(
+        zip(("camera", "image"), sources.ouvrir_source(sources.PREFIXE_FENETRE + "essai de lecteur"))))
+    fil.start()
+    while fil.is_alive():
+        image_suivante()
+        root.update()
+        time.sleep(0.08)
+    camera, image = resultat.get("camera"), resultat.get("image")
+    mode = camera.mode if camera else "aucun"
+    if camera:
+        camera.release()
+    root.destroy()
+    if image is None:
+        return [("lecteur caché : capturé", False, mode)]
+    h, l = image.shape[:2]
+    vert = image.reshape(-1, 3).mean(axis=0)[1] > 180 and image.reshape(-1, 3).mean(axis=0)[0] < 60
+    return [("lecteur caché : capturé, pas la fenêtre du dessus", not vert, mode),
+            ("lecteur caché : seule la vidéo est gardée", abs(l - 480) <= 6 and abs(h - 300) <= 6,
+             f"{l}x{h}, attendu 480x300")]
 
 
 def essai_flux():
@@ -132,7 +198,7 @@ def essai_page(adresse):
 
 def main():
     ok = True
-    resultats = essai_fenetre() + essai_bandes() + essai_flux()
+    resultats = essai_fenetre() + essai_bandes() + essai_lecteur_cache() + essai_flux()
     if len(sys.argv) > 1:
         resultats += essai_page(sys.argv[1])
     for nom, reussi, detail in resultats:

@@ -30,7 +30,7 @@ import time
 import unicodedata
 import zipfile
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import cv2
@@ -49,6 +49,18 @@ EXEMPLE_DIFFERENT = 0.92        # une nouvelle vue n'entre en galerie que si ell
 
 def sans_accents(texte):
     return unicodedata.normalize("NFKD", texte).encode("ascii", "ignore").decode()
+
+
+def ajuster(image, taille):
+    """Met l'image à la taille (l, h) sans la déformer : mise à l'échelle, puis bandes noires.
+    Une tortue étirée serait moins bien reconnue."""
+    l, h = taille
+    e = min(l / image.shape[1], h / image.shape[0])
+    nl, nh = max(1, round(image.shape[1] * e)), max(1, round(image.shape[0] * e))
+    sortie = np.zeros((h, l, 3), np.uint8)
+    x, y = (l - nl) // 2, (h - nh) // 2
+    sortie[y:y + nh, x:x + nl] = cv2.resize(image, (nl, nh))
+    return sortie
 
 
 def nom_fichier(texte):
@@ -417,12 +429,37 @@ class Registre:
                 p.replace(dc / p.name)
             shutil.rmtree(ds, ignore_errors=True)
             self.fiches[cible]["provisoire"] = False if not self.fiches[source]["provisoire"] else self.fiches[cible]["provisoire"]
+            pesees = self.fiches[cible].get("pesees", []) + self.fiches[source].get("pesees", [])
+            if pesees:
+                self.fiches[cible]["pesees"] = sorted(pesees, key=lambda p: p["date"])
             del self.fiches[source]
             self.alias[source] = cible
             self.vecteurs.pop(source, None)
             self.fichiers.pop(source, None)
             self._ecrire()
             self._lire_galerie(cible)
+
+    # --- pesées : [{"date": "AAAA-MM-JJ", "g": 1234.0, "note": "..."}] par ordre de date
+    def ajouter_pesee(self, cle, jour, grammes, note=""):
+        """Ajoute une pesée ; une seconde pesée le même jour remplace la première."""
+        grammes = float(grammes)
+        if not 1 <= grammes <= 200000:
+            raise ValueError("poids hors limites (1 g à 200 kg)")
+        jour = date.fromisoformat(str(jour)).isoformat()
+        with self._verrou:
+            pesees = [p for p in self.fiches[cle].get("pesees", []) if p["date"] != jour]
+            pesees.append({"date": jour, "g": round(grammes, 1), "note": note.strip()})
+            self.fiches[cle]["pesees"] = sorted(pesees, key=lambda p: p["date"])
+            self._ecrire()
+
+    def retirer_pesee(self, cle, jour):
+        with self._verrou:
+            self.fiches[cle]["pesees"] = [p for p in self.fiches[cle].get("pesees", []) if p["date"] != jour]
+            self._ecrire()
+
+    def pesees(self, cle):
+        with self._verrou:
+            return [dict(p) for p in self.fiches.get(cle, {}).get("pesees", [])]
 
     def supprimer(self, cle):
         with self._verrou:
@@ -482,6 +519,10 @@ SEUIL_PROPOSITION = 0.38        # en dessous, une tortue ne ressemble pas assez 
 IMAGES_SURES = 2                # images sûres qu'il faut dans une visite pour nommer la tortue
 ECART_IMAGES_SURES = 8.0        # secondes entre elles : deux images du même instant ne valent qu'une preuve
 SUPPLEMENT_FICHE_UNIQUE = 0.15  # une seule fiche : sans deuxième candidate, la marge ne protège de rien
+GALERIE_MIN = 10                # photos de galerie qu'il faut pour aider le filtre « tortue ou pas »
+GALERIE_BAS, GALERIE_HAUT = 0.64, 0.74   # ressemblance (5 meilleures) : objets ≤ 0,63, tortues ≥ 0,75
+FIGEE_S = 60.0                  # direct : sans aucun changement pendant 1 min, l'image est figée
+SEUIL_FIGEE = 4                 # écart de gris, sur une image de 96 px de large, compté comme un changement
 
 
 # ------------------------------------------------------------------
@@ -539,6 +580,18 @@ class Piste:
 
     def probable(self):
         return max(self.proposition, key=self.proposition.get) if self.proposition else None
+
+
+def ressemblance_galerie(classeur, galerie, image, boite):
+    """Probabilité « tortue » d'après la ressemblance aux photos de galerie : moyenne des 5
+    photos les plus proches, tortue isolée sur fond gris comme dans la galerie. 0 sous
+    GALERIE_BAS, 1 au-dessus de GALERIE_HAUT."""
+    tortue = vision.isoler_tortue(image, boite)
+    if tortue is None:
+        return 0.0
+    s = galerie @ classeur.vecteur(tortue)
+    proche = float(np.sort(s)[-5:].mean())
+    return float(np.clip((proche - GALERIE_BAS) / (GALERIE_HAUT - GALERIE_BAS), 0.0, 1.0))
 
 
 def ecart(a, b):
@@ -646,7 +699,8 @@ class Surveillance:
     def __init__(self, source, dossier, registre=None, detecteur=None, classeur=None,
                  seuil=SEUIL_INDIVIDU, marge=MARGE_INDIVIDU, surface=0.01, avant=3, apres=20, clip_max=120,
                  analyse_toutes=None, veille_toutes=None, reconnaissance=True, creer_nouvelles=False, zone=None,
-                 sur_image=None, sur_visite=None, sur_message=None, temps_reel=False, menage_jours=60, menage_go=20.0):
+                 sur_image=None, sur_visite=None, sur_message=None, temps_reel=False, menage_jours=60, menage_go=20.0,
+                 sur_figee=None):
         self.source = source_depuis_texte(source)
         self.dossier = Path(dossier)
         self.registre = registre or Registre(self.dossier)
@@ -666,6 +720,9 @@ class Surveillance:
         self.sur_image = sur_image or (lambda vue, etat: None)
         self.sur_visite = sur_visite or (lambda ligne: None)
         self.sur_message = sur_message or print
+        self.sur_figee = sur_figee or (lambda figee: None)
+        self.figee_s = FIGEE_S
+        self._galerie_cache, self._galerie_matrice, self._galerie_vue = None, None, 0.0
         self.temps_reel = temps_reel
         self.arret = threading.Event()
         self.pistes = []
@@ -736,8 +793,14 @@ class Surveillance:
     def _analyser(self, image, instant):
         t0 = time.time()
         fiches = []
+        galerie = self._galerie_especes()
         for score, boite in self.detecteur.detecter(image):
             p_tortue, classes = self.classeur.classer(vision.recadrer(image, boite))
+            if p_tortue < 0.5 and galerie is not None:
+                # de loin, une tortue floue passe pour un chien ou un chat auprès du filtre par le
+                # texte ; comparée aux photos des tortues de la maison, prises par la même caméra,
+                # elle se reconnaît bien mieux (mesuré : tortues 0,75 à 0,78, objets 0,63 au plus)
+                p_tortue = max(p_tortue, ressemblance_galerie(self.classeur, galerie, image, boite))
             if p_tortue >= 0.3:
                 fiches.append((score, boite, p_tortue, classes))
         with self._verrou:
@@ -758,6 +821,30 @@ class Surveillance:
             if not piste.etiquette:
                 piste.etiquette = piste.espece()
         self.duree_analyse = time.time() - t0
+
+    def _galerie_especes(self):
+        """Vecteurs BioCLIP des photos de galerie (tortues isolées de la maison), revus toutes les
+        10 min ; seuls les nouveaux fichiers sont calculés. None s'il y en a moins de GALERIE_MIN."""
+        if not hasattr(self.classeur, "vecteur"):
+            return None
+        if time.time() - self._galerie_vue < 600 and self._galerie_cache is not None:
+            return self._galerie_matrice
+        self._galerie_vue = time.time()
+        cache = self._galerie_cache or {}
+        actuel = {}
+        for p in sorted(Path(self.registre.dossier).glob("*/*.jpg")):
+            if p.parent.name == "pas_une_tortue":
+                continue
+            cle = (str(p), p.stat().st_size)
+            if cle in cache:
+                actuel[cle] = cache[cle]
+            else:
+                img = lire_image(p)
+                if img is not None:
+                    actuel[cle] = self.classeur.vecteur(img)
+        self._galerie_cache = actuel
+        self._galerie_matrice = np.stack(list(actuel.values())) if len(actuel) >= GALERIE_MIN else None
+        return self._galerie_matrice
 
     def _seuil_image(self):
         unique = sum(g is not None for g in self.registre.vecteurs.values()) <= 1
@@ -930,6 +1017,7 @@ class Surveillance:
         taille = None
         t_fps, n_fps, fps_mesure = time.time(), 0, 0.0
         t_debut, t_menage = time.time(), time.time()
+        petite_prec, t_change, figee = None, time.time(), False
         try:
             while not self.arret.is_set():
                 if self.fichier:
@@ -951,8 +1039,23 @@ class Surveillance:
                 if taille is None:
                     taille = (image.shape[1], image.shape[0])
                 elif (image.shape[1], image.shape[0]) != taille:
-                    image = cv2.resize(image, taille)   # reconnexion dans une autre résolution : même format de clip
+                    image = ajuster(image, taille)   # autre résolution ou autre cadre : même format de clip
 
+                # image figée : un direct vivant change toujours un peu (bruit de compression, horloge
+                # incrustée). Rien ne bouge pendant FIGEE_S : le lecteur a sans doute arrêté le direct.
+                if not self.fichier:
+                    petite = cv2.cvtColor(cv2.resize(image, (96, max(1, 96 * image.shape[0] // image.shape[1]))),
+                                          cv2.COLOR_BGR2GRAY)
+                    if petite_prec is None or petite.shape != petite_prec.shape or \
+                            int(cv2.absdiff(petite, petite_prec).max()) > SEUIL_FIGEE:
+                        t_change = time.time()
+                    petite_prec = petite
+                    maintenant_figee = time.time() - t_change >= self.figee_s
+                    if maintenant_figee != figee:
+                        figee = maintenant_figee
+                        self.sur_message("Image figée depuis 1 min : le direct est sans doute arrêté" if figee
+                                         else "Image revenue : le direct tourne")
+                        self.sur_figee(figee)
                 mouvement = self._mouvement(fond, image)
                 intervalle = self.analyse_toutes if (self.pistes or mouvement) else self.veille_toutes
                 if instant - derniere_analyse >= intervalle:
@@ -1002,7 +1105,8 @@ class Surveillance:
                 self.sur_image(image, {"tortues": [(p.boite, p.etiquette or "…") for p in confirmees],
                                        "enregistrement": self.video is not None, "fps": fps_mesure,
                                        "duree": instant - self.debut_clip if self.video is not None else 0,
-                                       "presence": len(confirmees)})
+                                       "presence": len(confirmees),
+                                       "figee_s": time.time() - t_change if figee else 0})
         finally:
             if fil is not None:
                 fil.join(30)

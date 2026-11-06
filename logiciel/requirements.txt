@@ -6,3 +6,4 @@ torch==2.14.1
 timm==1.0.30
 open_clip_torch==3.3.0
 yt-dlp
+windows-capture==2.0.1

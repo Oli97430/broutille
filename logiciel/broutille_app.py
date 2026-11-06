@@ -9,6 +9,7 @@ apprend aussitôt, temps de repas du jour et historique avec vignettes.
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -21,6 +22,9 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
+import demarrage
+import rapports
+import sauvegarde
 import sources
 import vision
 from broutille_cam import (INCONNUE, MARGE_INDIVIDU, PAS_UNE_TORTUE, SEUIL_INDIVIDU, JournalOccupe, Registre,
@@ -41,6 +45,12 @@ DEFAUTS = {
     "menage_jours": 60,
     "menage_go": 20,
     "demarrage_auto": False,
+    "lancer_avant": "",         # programme ouvert avant la surveillance (ex. EZVIZ Studio), au démarrage de Windows
+    "sans_admin": False,        # ouvrir ce programme sans droits administrateur : permet la relance du direct
+    "relance_auto": False,      # image figée : cliquer sur le bouton du lecteur qui relance le direct
+    "relance_point": None,      # ce bouton, en fractions de la fenêtre du lecteur
+    "sauvegarde_dossier": "",   # clé USB, OneDrive... ; vide = pas de sauvegarde
+    "rappel_pesee_jours": 30,   # tortue en orange si sa dernière pesée est plus ancienne ; 0 = jamais
     "especes_actives": [e[1] for e in vision.ESPECES_DEFAUT[:2]],   # noms scientifiques
     "zones": {},                # source -> partie de l'image à garder (x0, y0, x1, y1 en fractions)
 }
@@ -94,6 +104,9 @@ class App:
         self.photo_visite = None
         self.modeles_prets = False
         self.fermeture = False
+        self.figee = False
+        self.relance_serie = 0          # numéro de la série d'essais de relance en cours
+        self.sauvegarde_en_cours = False
         self.detecteur = vision.DetecteurTortues()
         self.classeur = vision.ClasseurEspeces([e for e in vision.ESPECES_DEFAUT if e[1] in self.cfg["especes_actives"]])
         self.registre = Registre(self.dossier)
@@ -104,8 +117,40 @@ class App:
         threading.Thread(target=self._precharger, daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self.quitter)
         self.root.after(30, self._boucle)
-        if self.cfg["demarrage_auto"]:
+        if "--demarrage" in sys.argv:            # lancé par le raccourci du dossier Démarrage
+            self.root.after(500, self._demarrage_windows)
+        elif self.cfg["demarrage_auto"]:
             self.root.after(500, self.demarrer)
+        self.root.after(15000, self._sauvegarde_auto)
+
+    def _demarrage_windows(self):
+        """Au démarrage de Windows : ouvre le programme prévu (EZVIZ Studio), attend sa fenêtre
+        jusqu'à 2 min, puis lance la surveillance. Sans fenêtre à attendre, démarre tout de suite."""
+        source = source_depuis_saisie(self.var_source.get())
+        programme = self.cfg["lancer_avant"]
+        attendre = sources.est_fenetre(source)
+        if programme and attendre and not sources.trouver_fenetre(source[len(sources.PREFIXE_FENETRE):]):
+            try:
+                demarrage.lancer_programme(programme, self.cfg["sans_admin"])
+            except OSError as e:
+                self.lbl_etat.configure(text=f"Impossible d'ouvrir {Path(programme).name} : {e}")
+        fin = time.time() + 120
+
+        def verifier():
+            if self.surveillance:
+                return
+            if not attendre or sources.trouver_fenetre(source[len(sources.PREFIXE_FENETRE):]):
+                # quelques secondes de plus : le lecteur doit encore afficher le direct
+                # revérifié au moment de démarrer : l'utilisateur a pu cliquer sur Démarrer entre-temps
+                self.root.after(15000 if attendre else 0, lambda: None if self.surveillance else self.demarrer())
+                self.lbl_etat.configure(text="Démarrage de la surveillance…")
+            elif time.time() < fin:
+                self.lbl_etat.configure(text=f"En attente de la fenêtre « {source[len(sources.PREFIXE_FENETRE):]} »…")
+                self.root.after(2000, verifier)
+            else:
+                self.lbl_etat.configure(text="Fenêtre introuvable après 2 min : ouvrez-la puis cliquez sur Démarrer")
+
+        verifier()
 
     # -------------------------------------------------------------- config
     def _lire_config(self):
@@ -282,8 +327,10 @@ class App:
         self.lignes = {}
         cadre = ttk.Frame(onglets, style="Carte.TFrame")
         onglets.add(cadre, text="Mes tortues")
-        self.arbre_t = self._arbre(cadre, (("nom", "NOM", 122), ("visites", "VISITES", 54), ("vue", "VUE", 72)))
+        self.arbre_t = self._arbre(cadre, (("nom", "NOM", 122), ("visites", "VISITES", 54), ("vue", "VUE", 64),
+                                           ("pesee", "PESÉE", 70)))
         self.arbre_t.tag_configure("provisoire", foreground=AMBRE)
+        self.arbre_t.tag_configure("a_peser", foreground="#ffa657")
         self.arbre_t.tag_configure("absente", foreground=ROUGE)
         self.arbre_t.bind("<Button-3>", self._menu_tortue)
         self.arbre_t.bind("<Double-1>", self._ouvrir_galerie)
@@ -361,10 +408,64 @@ class App:
         ligne(3, "Taille maximale du dossier (Go, 0 = sans limite)", v_go, 8)
         v_auto = tk.BooleanVar(value=self.cfg["demarrage_auto"])
         ttk.Checkbutton(f, text="Démarrer la surveillance à l'ouverture", variable=v_auto).grid(row=4, column=0, columnspan=2, sticky="w", pady=6)
+        v_windows = tk.BooleanVar(value=demarrage.est_active())
+        ttk.Checkbutton(f, text="Lancer Broutille au démarrage de Windows (la surveillance démarre seule)",
+                        variable=v_windows).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
+        conseille = demarrage.programme_conseille() if sources.est_fenetre(str(self.cfg["source"])) else ""
+        v_avant = tk.StringVar(value=self.cfg["lancer_avant"] or conseille)
+        ligne(6, "Ouvrir d'abord ce programme (ex. EZVIZ Studio)", v_avant)
+        ttk.Button(f, text="…", width=3, command=lambda: v_avant.set(
+            filedialog.askopenfilename(parent=f, filetypes=[("Programme ou raccourci", "*.exe *.lnk")]) or v_avant.get())
+                   ).grid(row=6, column=2, padx=(6, 0))
+        ttk.Label(f, text="Laissez vide si la source n'est pas une fenêtre. Broutille attend la fenêtre jusqu'à 2 min.",
+                  style="Discret.TLabel").grid(row=7, column=0, columnspan=3, sticky="w")
+        v_sans_admin = tk.BooleanVar(value=self.cfg["sans_admin"])
+        ttk.Checkbutton(f, text="L'ouvrir sans droits administrateur (nécessaire pour relancer le direct d'EZVIZ Studio)",
+                        variable=v_sans_admin).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        v_relance = tk.BooleanVar(value=self.cfg["relance_auto"])
+        ttk.Checkbutton(f, text="Image figée : relancer le direct en cliquant sur ce bouton du lecteur",
+                        variable=v_relance).grid(row=9, column=0, columnspan=2, sticky="w", pady=6)
+        point = [self.cfg["relance_point"]]
+        lbl_point = ttk.Label(f, style="Discret.TLabel", text=f"bouton appris ({point[0][0]:.0%}, {point[0][1]:.0%})"
+                              if point[0] else "aucun bouton appris")
+        lbl_point.grid(row=10, column=1, sticky="w")
+
+        def apprendre():
+            source = source_depuis_saisie(self.var_source.get())
+            if not sources.est_fenetre(source):
+                messagebox.showinfo("Bouton de relance", "La source doit être une fenêtre (🪟 Fenêtre).", parent=f)
+                return
+            titre = source[len(sources.PREFIXE_FENETRE):]
+            messagebox.showinfo("Bouton de relance", f"Après OK : posez la souris sur le bouton de « {titre} » qui relance "
+                                                    "le direct (ou sur la caméra dans sa liste), et ne bougez plus 3 secondes.",
+                                parent=f)
+            lbl_point.configure(text="En attente : souris immobile 3 s sur le bouton…")
+
+            def travail():
+                trouve = sources.apprendre_point(titre)
+
+                def fini():
+                    if trouve:
+                        point[0] = trouve
+                        lbl_point.configure(text=f"bouton appris ({trouve[0]:.0%}, {trouve[1]:.0%})")
+                        v_relance.set(True)
+                    else:
+                        lbl_point.configure(text="pas de bouton appris : recommencez")
+                if f.winfo_exists():
+                    f.after(0, fini)
+            threading.Thread(target=travail, daemon=True).start()
+
+        ttk.Button(f, text="📍  Montrer le bouton…", command=apprendre).grid(row=10, column=0, sticky="w")
+        v_sauvegarde = tk.StringVar(value=self.cfg["sauvegarde_dossier"])
+        ligne(11, "Sauvegarde quotidienne dans (clé USB, OneDrive…)", v_sauvegarde)
+        ttk.Button(f, text="…", width=3, command=lambda: v_sauvegarde.set(filedialog.askdirectory(parent=f) or v_sauvegarde.get())
+                   ).grid(row=11, column=2, padx=(6, 0))
+        v_pesee = tk.StringVar(value=str(self.cfg["rappel_pesee_jours"]))
+        ligne(12, "Rappeler de peser une tortue après (jours, 0 = jamais)", v_pesee, 8)
         ttk.Label(f, text="Espèces présentes à la mangeoire (moins il y en a, moins Broutille se trompe)",
-                  style="Discret.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 4))
+                  style="Discret.TLabel").grid(row=13, column=0, columnspan=3, sticky="w", pady=(10, 4))
         cadre_especes = ttk.Frame(f, style="Carte.TFrame")
-        cadre_especes.grid(row=6, column=0, columnspan=3, sticky="w")
+        cadre_especes.grid(row=14, column=0, columnspan=3, sticky="w")
         coches = {}
         for i, (nom, sci, _en) in enumerate(vision.ESPECES_DEFAUT):
             coches[sci] = tk.BooleanVar(value=sci in self.cfg["especes_actives"])
@@ -373,6 +474,7 @@ class App:
         def enregistrer():
             try:
                 alerte, jours, go = int(v_alerte.get()), int(v_jours.get()), float(v_go.get())
+                rappel = int(v_pesee.get())
             except ValueError:
                 messagebox.showerror("Réglages", "Les jours et la taille doivent être des nombres.", parent=f)
                 return
@@ -385,9 +487,20 @@ class App:
                 messagebox.showerror("Réglages", "Arrêtez la surveillance avant de changer de dossier.", parent=f)
                 return
             change = actives != self.cfg["especes_actives"]
+            if v_relance.get() and not point[0]:
+                messagebox.showerror("Réglages", "Montrez d'abord le bouton de relance (📍).", parent=f)
+                return
+            try:
+                demarrage.activer() if v_windows.get() else demarrage.desactiver()
+            except OSError as e:
+                messagebox.showerror("Réglages", f"Démarrage avec Windows impossible : {e}", parent=f)
+                return
             self.cfg.update(dossier=v_dossier.get(), alerte_jours=alerte, menage_jours=jours, menage_go=go,
-                            demarrage_auto=v_auto.get(), especes_actives=actives)
+                            demarrage_auto=v_auto.get(), especes_actives=actives, lancer_avant=v_avant.get().strip(),
+                            sans_admin=v_sans_admin.get(), relance_auto=v_relance.get(), relance_point=point[0],
+                            sauvegarde_dossier=v_sauvegarde.get().strip(), rappel_pesee_jours=max(0, rappel))
             self._ecrire_config()
+            self._sauvegarde_maintenant()
             f.destroy()
             if nouveau_dossier:
                 self.registre = Registre(self.dossier, self.registre.descripteur)
@@ -404,9 +517,9 @@ class App:
         n_rejets = self.registre.nombre_rejets()
         btn_rejets = ttk.Button(f, text=f"Oublier les « Pas une tortue » ({n_rejets})", command=oublier,
                                 state="normal" if n_rejets else "disabled")
-        btn_rejets.grid(row=7, column=0, sticky="w", pady=(14, 0))
+        btn_rejets.grid(row=15, column=0, sticky="w", pady=(14, 0))
 
-        ttk.Button(f, text="Enregistrer", style="Vert.TButton", command=enregistrer).grid(row=7, column=1, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(f, text="Enregistrer", style="Vert.TButton", command=enregistrer).grid(row=15, column=1, columnspan=2, sticky="e", pady=(14, 0))
 
     # -------------------------------------------------------------- surveillance
     def basculer(self):
@@ -422,7 +535,8 @@ class App:
             creer_nouvelles=self.cfg["creer_nouvelles"], menage_jours=self.cfg["menage_jours"],
             menage_go=self.cfg["menage_go"], temps_reel=True, zone=self.cfg["zones"].get(source),
             sur_image=self._sur_image, sur_visite=lambda l: self.messages.put(("visite", l)),
-            sur_message=lambda m: self.messages.put(("message", m)))
+            sur_message=lambda m: self.messages.put(("message", m)),
+            sur_figee=lambda f: self.messages.put(("figee", f)))
         self.btn_demarrer.configure(text="■  Arrêter", style="Rouge.TButton")
         threading.Thread(target=self._executer, args=(self.surveillance,), daemon=True).start()
 
@@ -474,6 +588,15 @@ class App:
                 self.lbl_etat.configure(text=contenu)
             elif genre == "tortues":
                 self._maj_tortues()
+            elif genre == "figee":
+                self.figee = contenu
+                self.relance_serie += 1          # une seule série d'essais à la fois
+                if contenu:
+                    self.root.bell()
+                    serie = self.relance_serie
+                    self.root.after(3000, lambda: self._relancer_direct(1, serie))
+            elif genre == "sauvegarde":
+                self.lbl_etat.configure(text=contenu)
             elif genre == "visite":
                 self._ajouter_visite(contenu, True)
                 self._afficher_visite(contenu)
@@ -491,6 +614,8 @@ class App:
                 if not contenu:
                     messagebox.showerror("Source vidéo", self.lbl_etat.cget("text"))
                 self.surveillance, self.derniere_image = None, None
+                self.figee = False               # la prochaine surveillance repart d'une image vivante
+                self.relance_serie += 1
                 self.btn_demarrer.configure(text="▶  Démarrer", style="Vert.TButton", state="normal")
                 self.pastille.configure(text="●  En veille", fg=DISCRET)
                 self._afficher_vide()
@@ -500,7 +625,7 @@ class App:
         f = tk.Toplevel(self.root, bg=CARTE, padx=16, pady=14)
         f.title("Filmer une fenêtre ouverte")
         f.transient(self.root)
-        ttk.Label(f, text="La fenêtre doit rester ouverte, pas réduite.\nSi l'image est noire, gardez-la visible à l'écran.",
+        ttk.Label(f, text="La fenêtre doit rester ouverte, pas réduite.\nElle peut être cachée par d'autres : Broutille y trouve seul la vidéo.",
                   style="Discret.TLabel").pack(anchor="w", pady=(0, 8))
         liste = tk.Listbox(f, width=64, height=12, bg=FOND, fg=TEXTE, selectbackground=VERT, relief="flat", font=("Segoe UI", 10))
         liste.pack(fill="both", expand=True)
@@ -599,6 +724,11 @@ class App:
             d.ellipse([28, 28, 40, 40], fill="white")
             d.text((50, 22), f"REC {int(etat['duree']) // 60:02d}:{int(etat['duree']) % 60:02d}", font=self.f_petit, fill="white")
         d.text((nw - 90, 20), f"{etat['fps']:.0f} i/s", font=self.f_petit, fill=(200, 210, 200, 200))
+        if etat.get("figee_s"):
+            texte = f"IMAGE FIGÉE depuis {int(etat['figee_s'] // 60)} min — relancez le direct dans le lecteur"
+            tw = d.textlength(texte, font=self.f_petit)
+            d.rounded_rectangle([(nw - tw) / 2 - 18, nh - 62, (nw + tw) / 2 + 18, nh - 18], radius=14, fill=(248, 81, 73, 235))
+            d.text(((nw - tw) / 2, nh - 54), texte, font=self.f_petit, fill="white")
         self.image_affichee = ImageTk.PhotoImage(Image.alpha_composite(img, calque).convert("RGB"))
         self.video.configure(image=self.image_affichee)
 
@@ -759,14 +889,19 @@ class App:
             for c in (cle, l.get("id_proposition")):
                 derniere[c] = max(derniere.get(c, ""), l["date"])
         limite = (datetime.now() - timedelta(days=self.cfg["alerte_jours"])).strftime("%Y-%m-%d")
+        limite_pesee = (datetime.now() - timedelta(days=self.cfg["rappel_pesee_jours"])).strftime("%Y-%m-%d")
         for cle, fiche in sorted(self.registre.copie_fiches().items(), key=lambda x: (x[1].get("provisoire", False), x[1]["nom"])):
             d = self.registre.dossier / cle
             photos = sorted(d.glob("*.jpg")) if d.exists() else []
             vignette = self._vignette(photos[0], (64, 48)) if photos else None
             vue = derniere.get(cle, "")
-            tags = ("provisoire",) if fiche.get("provisoire") else ("absente",) if vue and vue < limite else ()
+            pesee = max((p["date"] for p in fiche.get("pesees", [])), default="")
+            a_peser = bool(self.cfg["rappel_pesee_jours"]) and not fiche.get("provisoire") and pesee < limite_pesee
+            tags = ("provisoire",) if fiche.get("provisoire") else ("absente",) if vue and vue < limite else \
+                ("a_peser",) if a_peser else ()
             a.insert("", "end", iid=cle, image=vignette or "", tags=tags,
-                     values=(fiche["nom"], visites[cle], f"{vue[8:]}/{vue[5:7]}" if vue else "jamais"))
+                     values=(fiche["nom"], visites[cle], f"{vue[8:]}/{vue[5:7]}" if vue else "jamais",
+                             (f"{pesee[8:]}/{pesee[5:7]}" if pesee else "à faire") + (" ⚖" if a_peser else "")))
             if vignette:
                 self.vignettes_tortues[cle] = vignette
 
@@ -829,6 +964,9 @@ class App:
         menu.add_command(label=f"{fiche['nom']} — {fiche['espece']}", state="disabled")
         menu.add_command(label="Nommer / changer l'espèce…", command=lambda: self._modifier_tortue(cle))
         menu.add_command(label="Ajouter des photos…", command=lambda: self._importer_photos(cle))
+        menu.add_command(label="⚖  Pesées et courbe de poids…", command=lambda: self.pesees(cle))
+        menu.add_command(label="📊  Repas sur 30 jours…", command=lambda: self.statistiques(cle))
+        menu.add_command(label="📄  Fiche pour le vétérinaire (PDF)…", command=lambda: self.fiche_veterinaire(cle))
         fusion = tk.Menu(menu, tearoff=0)
         for autre, f in sorted(self.registre.copie_fiches().items(), key=lambda x: x[1]["nom"]):
             if autre != cle:
@@ -878,35 +1016,227 @@ class App:
             os.startfile(self.registre.dossier / cle)
 
     # -------------------------------------------------------------- statistiques
-    def statistiques(self):
+    def statistiques(self, choisie=None):
+        """Tableau des 30 derniers jours ; un clic sur une tortue affiche le graphique de ses
+        repas, et le bouton fait sa fiche PDF pour le vétérinaire. choisie : clé à sélectionner."""
         f = tk.Toplevel(self.root, bg=CARTE, padx=16, pady=14)
         f.title("Statistiques — 30 derniers jours")
         f.transient(self.root)
         debut = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        par = defaultdict(lambda: {"n": 0, "s": 0.0, "jours": set(), "dernier": "", "espece": ""})
+        par = defaultdict(lambda: {"nom": "", "n": 0, "s": 0.0, "jours": set(), "dernier": "", "espece": ""})
         try:
             journal = lire_journal(self.dossier)
         except (JournalOccupe, OSError):
             journal = []
+        fiches = self.registre.copie_fiches()
         for l in journal:
             if l["date"] >= debut:
-                p = par[l["individu"]]
+                cle = l.get("id_individu") or f"nom:{l['individu']}"   # « Inconnue » n'a pas de fiche
+                p = par[cle]
+                p["nom"] = fiches[cle]["nom"] if cle in fiches else l["individu"]
                 p["n"] += 1
                 p["s"] += secondes(l)
                 p["jours"].add(l["date"])
                 p["dernier"] = max(p["dernier"], l["date"])
                 p["espece"] = l["espece"]
+        for cle, fiche in fiches.items():      # une tortue qui n'est pas venue apparaît aussi
+            if cle not in par and not fiche.get("provisoire"):
+                par[cle].update(nom=fiche["nom"], espece=fiche["espece"])
         colonnes = (("nom", "TORTUE", 170), ("espece", "ESPÈCE", 150), ("n", "VISITES", 70), ("temps", "TEMPS À TABLE", 110),
                     ("moy", "PAR JOUR DE VISITE", 130), ("jours", "JOURS VENUE", 90), ("vue", "DERNIÈRE VISITE", 110))
         ttk.Style(self.root).configure("Stats.Treeview", rowheight=28)
-        a = ttk.Treeview(f, columns=[c[0] for c in colonnes], show="headings", style="Stats.Treeview", height=14)
+        a = ttk.Treeview(f, columns=[c[0] for c in colonnes], show="headings", style="Stats.Treeview", height=8,
+                         selectmode="browse")
         for col, titre, larg in colonnes:
             a.heading(col, text=titre, anchor="w")
             a.column(col, width=larg, anchor="w")
         a.pack(fill="both", expand=True)
-        for nom, p in sorted(par.items(), key=lambda x: -x[1]["s"]):
-            a.insert("", "end", values=(nom, p["espece"], p["n"], duree_lisible(p["s"]), duree_lisible(p["s"] / max(len(p["jours"]), 1)),
-                                        len(p["jours"]), p["dernier"]))
+        for cle, p in sorted(par.items(), key=lambda x: -x[1]["s"]):
+            a.insert("", "end", iid=cle, values=(p["nom"], p["espece"], p["n"], duree_lisible(p["s"]),
+                                                 duree_lisible(p["s"] / max(len(p["jours"]), 1)) if p["jours"] else "—",
+                                                 len(p["jours"]), p["dernier"] or "—"))
+
+        bas = tk.Frame(f, bg=CARTE)
+        bas.pack(fill="x", pady=(12, 0))
+        graphe = tk.Label(bas, bg=CARTE, fg=DISCRET, text="Cliquez sur une tortue pour voir ses repas jour par jour.",
+                          font=("Segoe UI", 10))
+        graphe.pack(fill="x")
+        boutons = tk.Frame(bas, bg=CARTE)
+        boutons.pack(fill="x", pady=(10, 0))
+        btn_pdf = ttk.Button(boutons, text="📄  Fiche pour le vétérinaire (PDF)…", state="disabled",
+                             command=lambda: self.fiche_veterinaire(a.selection()[0]) if a.selection() else None)
+        btn_pdf.pack(side="right")
+
+        def montrer(_=None):
+            if not a.selection():
+                return
+            cle = a.selection()[0]
+            avec_fiche = cle in fiches
+            btn_pdf.configure(state="normal" if avec_fiche else "disabled")
+            if not avec_fiche:
+                graphe.configure(image="", text="Visites non reconnues : confirmez-les pour les compter à une tortue.")
+                return
+            img = rapports.graphique_repas(rapports.repas_par_jour(journal, cle), f"{fiches[cle]['nom']} — minutes à table par jour",
+                                           (900, 300), fond=(27, 33, 25), encre=(233, 238, 227), discret=(151, 163, 141),
+                                           filet=(45, 55, 41), barre=(127, 185, 80), vide=(248, 81, 73))
+            graphe.image = ImageTk.PhotoImage(img)
+            graphe.configure(image=graphe.image, text="")
+
+        a.bind("<<TreeviewSelect>>", montrer)
+        if choisie and a.exists(choisie):
+            a.selection_set(choisie)
+            a.see(choisie)
+            montrer()
+
+    # -------------------------------------------------------------- relance du direct, sauvegarde
+    def _relancer_direct(self, essai, serie):
+        """Image figée : clic sur le bouton du lecteur appris dans les Réglages. 5 essais,
+        espacés de 90 s, tant que l'image reste figée. Une série s'arrête dès qu'une autre
+        commence (nouvel état figé ou revenu, surveillance arrêtée)."""
+        source = str(self.cfg["source"])
+        if not (serie == self.relance_serie and self.figee and self.surveillance and self.cfg["relance_auto"]
+                and self.cfg["relance_point"] and sources.est_fenetre(source)):
+            return
+        try:
+            sources.cliquer(source[len(sources.PREFIXE_FENETRE):], self.cfg["relance_point"])
+            self.lbl_etat.configure(text=f"Image figée : relance du direct (essai {essai} sur 5)")
+        except sources.DroitsInsuffisants:
+            self.lbl_etat.configure(text="Relance impossible : le lecteur tourne en administrateur. Réglages › "
+                                         "« ouvrir sans droits administrateur », puis rouvrez-le par Broutille.")
+            return
+        except OSError as e:
+            self.lbl_etat.configure(text=f"Relance impossible : {e}")
+        if essai < 5:
+            self.root.after(90000, lambda: self._relancer_direct(essai + 1, serie))
+
+    def _sauvegarde_maintenant(self):
+        """Sauvegarde du jour, si elle manque, dans un fil : copier les galeries prend quelques secondes.
+        Une seule à la fois : deux fils écriraient la même archive temporaire."""
+        destination = self.cfg["sauvegarde_dossier"]
+        if destination and not self.sauvegarde_en_cours and sauvegarde.a_faire(destination):
+            self.sauvegarde_en_cours = True
+
+            def travail():
+                try:
+                    r = sauvegarde.sauvegarder(self.dossier, destination)
+                    if r:
+                        self.messages.put(("sauvegarde", f"Sauvegarde faite : {r[0].name} ({r[1]} fichiers)"))
+                except OSError as e:
+                    self.messages.put(("sauvegarde", f"Sauvegarde impossible : {e}"))
+                finally:
+                    self.sauvegarde_en_cours = False
+            threading.Thread(target=travail, daemon=True).start()
+
+    def _sauvegarde_auto(self):
+        self._sauvegarde_maintenant()
+        if self.root.winfo_exists():
+            self.root.after(3600 * 1000, self._sauvegarde_auto)     # revérifié toutes les heures
+
+    def pesees(self, cle):
+        """Pesées d'une tortue : saisie (date, poids en grammes, remarque), liste et courbe."""
+        fiche = self.registre.copie_fiches().get(cle)
+        if not fiche:
+            return
+        f = tk.Toplevel(self.root, bg=CARTE, padx=16, pady=14)
+        f.title(f"Poids de {fiche['nom']}")
+        f.transient(self.root)
+        saisie = tk.Frame(f, bg=CARTE)
+        saisie.pack(fill="x")
+        v_date = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
+        v_poids, v_note = tk.StringVar(), tk.StringVar()
+        for col, (texte, var, larg) in enumerate((("Date", v_date, 12), ("Poids (g)", v_poids, 10), ("Remarque", v_note, 30))):
+            ttk.Label(saisie, text=texte, style="Carte.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 10))
+            e = ttk.Entry(saisie, textvariable=var, width=larg)
+            e.grid(row=1, column=col, sticky="w", padx=(0, 10))
+            if var is v_poids:
+                e.focus_set()
+        graphe = tk.Label(f, bg=CARTE)
+        graphe.pack(fill="x", pady=(14, 8))
+        resume = ttk.Label(f, style="Carte.TLabel")
+        resume.pack(anchor="w")
+        colonnes = (("date", "DATE", 110), ("poids", "POIDS", 100), ("ecart", "ÉCART", 160), ("note", "REMARQUE", 340))
+        liste = ttk.Treeview(f, columns=[c[0] for c in colonnes], show="headings", height=7, selectmode="browse")
+        for col, titre, larg in colonnes:
+            liste.heading(col, text=titre, anchor="w")
+            liste.column(col, width=larg, anchor="w")
+        liste.pack(fill="both", expand=True, pady=(8, 0))
+        ttk.Label(f, text="Clic droit sur une pesée pour la retirer. Pesez à jeun, de préférence à la même heure.",
+                  style="Discret.TLabel").pack(anchor="w", pady=(6, 0))
+
+        def rafraichir():
+            pesees = self.registre.pesees(cle)
+            img = rapports.graphique_poids(pesees, "Courbe de poids", (820, 300), fond=(27, 33, 25), encre=(233, 238, 227),
+                                           discret=(151, 163, 141), filet=(45, 55, 41), trait=(127, 185, 80))
+            graphe.image = ImageTk.PhotoImage(img)
+            graphe.configure(image=graphe.image)
+            liste.delete(*liste.get_children())
+            precedent = None
+            lignes = []
+            for p in pesees:
+                ecart = rapports.ecart_lisible({"g": p["g"] - precedent, "pct": 100 * (p["g"] - precedent) / precedent}) \
+                    if precedent else "—"
+                lignes.append((p["date"], (f"{p['date'][8:10]}/{p['date'][5:7]}/{p['date'][:4]}",
+                                           rapports.poids_lisible(p["g"]), ecart, p.get("note", ""))))
+                precedent = p["g"]
+            for jour, valeurs in reversed(lignes):
+                liste.insert("", "end", iid=jour, values=valeurs)
+            b = rapports.bilan_poids(pesees)
+            if b:
+                texte = f"Dernier poids : {rapports.poids_lisible(b['dernier']['g'])}   ·   sur 30 jours : " \
+                        f"{rapports.ecart_lisible(b['mois'])}   ·   sur un an : {rapports.ecart_lisible(b['an'])}"
+                resume.configure(text=texte + ("   ·   PERTE DE 10 % OU PLUS" if b["alerte"] else ""),
+                                 foreground=ROUGE if b["alerte"] else TEXTE)
+            else:
+                resume.configure(text="Aucune pesée pour l'instant.", foreground=DISCRET)
+
+        def ajouter(_=None):
+            try:
+                jour = datetime.strptime(v_date.get().strip(), "%d/%m/%Y").date()
+                grammes = float(v_poids.get().replace(",", ".").replace(" ", "").lower().removesuffix("g"))
+                if jour > datetime.now().date():
+                    raise ValueError("date dans le futur")
+                self.registre.ajouter_pesee(cle, jour.isoformat(), grammes, v_note.get())
+            except ValueError as e:
+                messagebox.showerror("Pesée", f"Pesée refusée : {e}\nDate au format 05/11/2026, poids en grammes (ex. 1250).",
+                                     parent=f)
+                return
+            v_poids.set("")
+            v_note.set("")
+            rafraichir()
+
+        def menu_pesee(ev):
+            jour = liste.identify_row(ev.y)
+            if not jour:
+                return
+            liste.selection_set(jour)
+            m = tk.Menu(f, tearoff=0)
+            m.add_command(label="Retirer cette pesée", command=lambda: (self.registre.retirer_pesee(cle, jour), rafraichir()))
+            m.tk_popup(ev.x_root, ev.y_root)
+
+        ttk.Button(saisie, text="Ajouter", style="Vert.TButton", command=ajouter).grid(row=1, column=3, sticky="w")
+        f.bind("<Return>", ajouter)
+        liste.bind("<Button-3>", menu_pesee)
+        rafraichir()
+
+    def fiche_veterinaire(self, cle):
+        fiche = self.registre.copie_fiches().get(cle)
+        if not fiche:
+            return
+        chemin = filedialog.asksaveasfilename(title="Fiche pour le vétérinaire", defaultextension=".pdf",
+                                              initialdir=self.dossier, initialfile=rapports.nom_fichier_fiche(fiche),
+                                              filetypes=[("PDF", "*.pdf")])
+        if not chemin:
+            return
+        try:
+            journal = lire_journal(self.dossier)
+            rapports.fiche_veterinaire(chemin, self.dossier, fiche, cle, journal, galerie=self.registre.dossier / cle)
+        except PermissionError:
+            messagebox.showerror("Fiche", "Le fichier est ouvert dans un autre programme : fermez-le et recommencez.")
+            return
+        except (JournalOccupe, OSError) as e:
+            messagebox.showerror("Fiche", f"Fiche impossible : {e}")
+            return
+        os.startfile(chemin)
 
     def quitter(self):
         self._ecrire_config()
