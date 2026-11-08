@@ -9,6 +9,7 @@ apprend aussitôt, temps de repas du jour et historique avec vignettes.
 import json
 import os
 import queue
+import secrets
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ import rapports
 import sauvegarde
 import sources
 import vision
+import web
 from broutille_cam import (INCONNUE, MARGE_INDIVIDU, PAS_UNE_TORTUE, SEUIL_INDIVIDU, JournalOccupe, Registre,
                            ALBUM, RegistreIllisible, Surveillance, corriger_visite, inscrire_photos, lire_journal,
                            lire_positions, renommer_dans_journal, secondes)
@@ -56,6 +58,9 @@ DEFAUTS = {
     "rappel_pesee_jours": 30,   # tortue en orange si sa dernière pesée est plus ancienne ; 0 = jamais
     "especes_actives": [e[1] for e in vision.ESPECES_DEFAUT[:2]],   # noms scientifiques
     "zones": {},                # source -> partie de l'image à garder (x0, y0, x1, y1 en fractions)
+    "web_actif": False,         # accès depuis le téléphone (Wi-Fi de la maison)
+    "web_code": "",             # code à 6 chiffres demandé par le téléphone ; créé au premier usage
+    "web_port": 0,              # port retenu (0 = premier libre à partir de 8642)
 }
 
 # Thème
@@ -108,6 +113,8 @@ class App:
         self.fenetres_fiche = {}        # clé -> fenêtre de fiche ouverte
         self.diffusion = None           # fenêtre plein écran pour le stream (YouTube…)
         self.repas_du_jour = []         # [(nom, secondes)] des repas d'aujourd'hui, les plus longs d'abord
+        self.image_web = None           # dernière image pour le téléphone
+        self.serveur_web = None
         self.photo_visite = None
         self.modeles_prets = False
         self.fermeture = False
@@ -129,6 +136,8 @@ class App:
         elif self.cfg["demarrage_auto"]:
             self.root.after(500, self.demarrer)
         self.root.after(15000, self._sauvegarde_auto)
+        if self.cfg["web_actif"]:
+            self.root.after(800, lambda: self._web(True, silencieux=True))
 
     def _demarrage_windows(self):
         """Au démarrage de Windows : ouvre le programme prévu (EZVIZ Studio), attend sa fenêtre
@@ -297,6 +306,7 @@ class App:
         ttk.Button(suivi, text="📊  Statistiques", command=self.statistiques).pack(side="left", padx=(8, 0))
         ttk.Button(suivi, text="🧭  Comportement", command=self.comportement).pack(side="left", padx=(8, 0))
         ttk.Button(suivi, text="📺  Plein écran", command=self.plein_ecran).pack(side="left", padx=(8, 0))
+        ttk.Button(suivi, text="📱  Téléphone", command=self.telephone).pack(side="left", padx=(8, 0))
         r.bind("<F11>", lambda _e: self.plein_ecran())
 
         corps = tk.Frame(r, bg=FOND)
@@ -578,6 +588,7 @@ class App:
     def _sur_image(self, image, etat):
         with self.verrou:
             self.derniere_image = (image, etat)
+        self.image_web = (image, etat)          # lue par le serveur du téléphone, sans la consommer
 
     def _boucle(self):
         try:
@@ -638,7 +649,7 @@ class App:
                     return
                 if not contenu and self.diffusion is None:     # pas de boîte d'erreur en plein direct
                     messagebox.showerror("Source vidéo", self.lbl_etat.cget("text"))
-                self.surveillance, self.derniere_image = None, None
+                self.surveillance, self.derniere_image, self.image_web = None, None, None
                 self.figee = False               # la prochaine surveillance repart d'une image vivante
                 self.relance_serie += 1
                 self.btn_demarrer.configure(text="▶  Démarrer", style="Vert.TButton", state="normal")
@@ -789,6 +800,97 @@ class App:
         d.text(((lw - d.textlength(t, font=self.f_vide)) / 2, lh / 2 + 10), t, font=self.f_vide, fill=(151, 163, 141))
         self.image_affichee = ImageTk.PhotoImage(img)
         self.video.configure(image=self.image_affichee)
+
+    # -------------------------------------------------------------- téléphone
+    def _web(self, actif, silencieux=False):
+        """Lance ou arrête le serveur du téléphone ; renvoie True s'il tourne."""
+        if self.serveur_web:
+            self.serveur_web.arreter()
+            self.serveur_web = None
+        if actif:
+            if not self.cfg["web_code"]:
+                self.cfg["web_code"] = web.nouveau_code()
+            if not self.cfg.get("web_secret"):
+                self.cfg["web_secret"] = secrets.token_hex(32)
+            # port retenu d'une fois sur l'autre (l'adresse enregistrée sur le téléphone reste bonne) ;
+            # s'il est pris par un autre programme, on essaie les suivants
+            prefere = self.cfg.get("web_port") or web.PORT
+            for port in [prefere] + [p for p in range(web.PORT, web.PORT + 10) if p != prefere]:
+                try:
+                    self.serveur_web = web.Serveur(self.registre, lambda: self.dossier,
+                                                   lambda: self.image_web if self.surveillance else None,
+                                                   self.cfg["web_code"], port=port, secret=self.cfg["web_secret"],
+                                                   apres_modif=lambda: self.messages.put(("tortues", None))).demarrer()
+                    self.cfg["web_port"] = port
+                    break
+                except OSError:
+                    continue
+            if self.serveur_web is None:
+                if not silencieux:
+                    messagebox.showerror("Téléphone", f"Accès impossible : les ports {web.PORT} à {web.PORT + 9} sont pris.")
+                self.lbl_etat.configure(text="Accès téléphone impossible : ports occupés")
+                actif = False
+        self.cfg["web_actif"] = actif
+        self._ecrire_config()
+        return actif
+
+    def telephone(self):
+        """Fenêtre du téléphone : marche/arrêt, QR code à scanner, adresse et code."""
+        f = tk.Toplevel(self.root, bg=CARTE, padx=22, pady=18)
+        f.title("Voir Broutille sur le téléphone")
+        f.transient(self.root)
+        f.resizable(False, False)
+        v_actif = tk.BooleanVar(value=self.serveur_web is not None)
+        ttk.Checkbutton(f, text="Accès depuis le téléphone (Wi-Fi de la maison)", variable=v_actif,
+                        command=lambda: (self._web(v_actif.get()), montrer())).pack(anchor="w")
+        qr = tk.Label(f, bg=CARTE)
+        qr.pack(pady=(14, 8))
+        lbl_url = tk.Label(f, bg=CARTE, fg=TEXTE, font=("Segoe UI Semibold", 13))
+        lbl_url.pack()
+        lbl_code = tk.Label(f, bg=CARTE, fg=AMBRE, font=("Segoe UI Semibold", 13))
+        lbl_code.pack(pady=(4, 0))
+        ttk.Label(f, style="Discret.TLabel", justify="left", wraplength=420, text=(
+            "Scannez le QR code avec l'appareil photo du téléphone, branché sur le même Wi-Fi que ce PC. "
+            "Ensuite, ajoutez la page à l'écran d'accueil.\n\n"
+            "Au premier lancement, Windows demande d'autoriser Python : cochez « Réseaux privés ».\n"
+            "La page n'est pas visible depuis Internet.")).pack(anchor="w", pady=(12, 0))
+        bas = tk.Frame(f, bg=CARTE)
+        bas.pack(fill="x", pady=(14, 0))
+
+        def nouveau():
+            if messagebox.askyesno("Téléphone", "Changer le code ? Les téléphones déjà connectés devront rescanner.", parent=f):
+                self.cfg["web_code"] = web.nouveau_code()
+                self._web(True)
+                montrer()
+
+        btn_code = ttk.Button(bas, text="Nouveau code", command=nouveau)
+        btn_code.pack(side="left")
+        ttk.Button(bas, text="Fermer", command=f.destroy).pack(side="right")
+
+        def montrer():
+            s = self.serveur_web
+            v_actif.set(s is not None)
+            if s is None:
+                qr.configure(image="", text="Accès désactivé", fg=DISCRET, font=("Segoe UI", 11), width=30, height=10)
+                lbl_url.configure(text="")
+                lbl_code.configure(text="")
+                btn_code.configure(state="disabled")
+                return
+            btn_code.configure(state="normal")
+            try:
+                import io
+                import segno
+                tampon = io.BytesIO()
+                segno.make(s.url(), error="m").save(tampon, kind="png", scale=8, border=2, dark="#10140f", light="#ffffff")
+                tampon.seek(0)
+                qr.image = ImageTk.PhotoImage(Image.open(tampon))
+                qr.configure(image=qr.image, text="", width=0, height=0)
+            except ImportError:
+                qr.configure(image="", text="(installez segno pour le QR code)", fg=DISCRET, width=30, height=4)
+            lbl_url.configure(text=s.url(avec_code=False))
+            lbl_code.configure(text=f"Code : {s.code}")
+
+        montrer()
 
     # -------------------------------------------------------------- plein écran (stream)
     def plein_ecran(self):
@@ -2146,6 +2248,9 @@ class App:
 
     def quitter(self):
         self._ecrire_config()
+        if self.serveur_web:
+            self.serveur_web.arreter()
+            self.serveur_web = None
         if not self.surveillance:
             self.root.destroy()
             return
