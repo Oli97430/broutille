@@ -33,6 +33,8 @@ from broutille_cam import ALBUM, INCONNUE, JournalOccupe, lire_journal, nom_fich
 PORT = 8642                      # 8765 est souvent pris (autres petits serveurs maison)
 MAX_PHOTO = 25 * 1024 * 1024
 ESSAIS_MAX, BLOCAGE_S = 8, 600       # code faux 8 fois : adresse bloquée 10 min
+ESSAIS_MAX_TOTAL = 30                 # tous appareils confondus : au-delà, plus aucun code accepté 10 min
+PAUSE_ECHEC_S = 1.0                   # chaque code faux coûte une seconde : essayer en masse devient inutile
 
 
 def nouveau_code():
@@ -81,6 +83,9 @@ class Serveur:
         # téléphones restent connectés d'un lancement à l'autre.
         self.jeton = hmac.new((secret or secrets.token_hex(32)).encode(), code.encode(), hashlib.sha256).hexdigest()
         self.echecs = {}                # ip -> (nombre, instant du dernier)
+        self.echecs_total = []          # instants des codes faux, toutes adresses (on peut changer d'adresse)
+        self._verrou_codes = threading.Lock()
+        # les téléphones déjà connectés (jeton en cookie) ne passent jamais par là : un blocage ne les gêne pas
         self.f_nom, self.f_petit = _police(36, True), _police(18)   # lisible sur un petit écran
         serveur = self
 
@@ -191,22 +196,33 @@ class Serveur:
 
     # --- sécurité
     def bloque(self, ip):
-        n, t = self.echecs.get(ip, (0, 0))
-        if n >= ESSAIS_MAX and time.time() - t < BLOCAGE_S:
-            return True
-        if n >= ESSAIS_MAX:
-            self.echecs.pop(ip, None)
-        return False
+        with self._verrou_codes:
+            maintenant = time.time()
+            self.echecs_total = [t for t in self.echecs_total if maintenant - t < BLOCAGE_S]
+            if len(self.echecs_total) >= ESSAIS_MAX_TOTAL:
+                return True
+            n, t = self.echecs.get(ip, (0, 0))
+            if n >= ESSAIS_MAX and maintenant - t < BLOCAGE_S:
+                return True
+            if n >= ESSAIS_MAX or (n and maintenant - t >= BLOCAGE_S):
+                self.echecs.pop(ip, None)
+            return False
 
     def verifier(self, ip, code):
         if self.bloque(ip):
             return False
-        if code and hmac.compare_digest(str(code), self.code):
-            self.echecs.pop(ip, None)
+        if code and hmac.compare_digest(str(code).encode(), self.code.encode()):
+            with self._verrou_codes:
+                self.echecs.pop(ip, None)
             return True
         if code:
-            n, _t = self.echecs.get(ip, (0, 0))
-            self.echecs[ip] = (n + 1, time.time())
+            with self._verrou_codes:
+                n, _t = self.echecs.get(ip, (0, 0))
+                self.echecs[ip] = (n + 1, time.time())
+                self.echecs_total.append(time.time())
+                if len(self.echecs) > 1000:     # pas de mémoire qui gonfle avec des adresses inventées
+                    self.echecs.clear()
+            time.sleep(PAUSE_ECHEC_S)
         return False
 
 
@@ -242,9 +258,12 @@ class _Gestion(BaseHTTPRequestHandler):
         return hmac.compare_digest(self._cookie().encode(), self.app.jeton.encode())
 
     def _lire_corps(self, maxi):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > maxi:
-            raise ValueError("trop gros")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("taille illisible") from None
+        if not 0 <= n <= maxi:          # négatif : read(-1) lirait jusqu'à la fin, sans limite
+            raise ValueError("taille refusée")
         return self.rfile.read(n)
 
     def _fichier_image(self, chemin):

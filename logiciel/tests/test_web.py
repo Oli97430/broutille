@@ -111,6 +111,14 @@ st, _, _, corps = req("GET", "/?code=123456")
 verifier("trop d'essais faux : bloqué, même avec le bon code", st == 403 and "10 minutes" in corps.decode())
 st, *_ = req("GET", "/api/etat", entetes=COOKIE)
 verifier("un téléphone déjà connecté continue", st == 200)
+st, _, _, corps = req("POST", f"/api/photo?cle={zoe}", b"", {**COOKIE, "Content-Length": "-1"})
+verifier("taille négative refusée", st == 400)
+web.PAUSE_ECHEC_S = 0
+s2 = web.Serveur(r, lambda: d, lambda: None, "654321", port=0, hote="127.0.0.1")
+for k in range(web.ESSAIS_MAX_TOTAL):
+    s2.verifier(f"10.0.{k}.1", "000000")
+verifier("trop d'essais en changeant d'adresse : bloqué partout", not s2.verifier("10.9.9.9", "654321"))
+s2.httpd.server_close()
 
 s.arreter()
 print(f"\n{ok} vérifications réussies")
