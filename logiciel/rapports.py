@@ -14,6 +14,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+import fiches
+
 JOURS = 30
 # page A4 à 150 points par pouce
 PAGE = (1240, 1754)
@@ -267,7 +269,7 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
     y = MARGE
     d.text((MARGE, y), fiche.get("nom", "Tortue"), font=f_titre, fill=ENCRE)
     y += 70
-    d.text((MARGE, y), fiche.get("espece", ""), font=f_sous, fill=GRIS)
+    d.text((MARGE, y), fiches.resume_identite(fiche, fin), font=f_sous, fill=GRIS)
     d.text((PAGE[0] - MARGE, MARGE + 12), f"Fiche du {fin.strftime('%d/%m/%Y')}", font=f_texte, fill=GRIS, anchor="ra")
     d.text((PAGE[0] - MARGE, MARGE + 50), f"Réf. {cle}", font=f_petit, fill=GRIS, anchor="ra")
     y += 60
@@ -301,6 +303,10 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
         ("Dernière visite", f"{visites[0]['date'][8:10]}/{visites[0]['date'][5:7]}/{visites[0]['date'][:4]} à {visites[0].get('heure', '')[:5]}"
          if visites else "aucune"),
     ]
+    if fiche.get("arrivee"):
+        lignes.append(("Arrivée à la maison", fiches.date_lisible(fiche["arrivee"])))
+    if fiche.get("signes"):
+        lignes.append(("Signes distinctifs", fiche["signes"][:60]))
     bp = bilan_poids(fiche.get("pesees", []), fin)
     if bp:
         jour = bp["dernier"]["date"]

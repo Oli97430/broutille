@@ -20,16 +20,19 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
+import comportement
+import deplacements
 import demarrage
+import fiches
 import rapports
 import sauvegarde
 import sources
 import vision
 from broutille_cam import (INCONNUE, MARGE_INDIVIDU, PAS_UNE_TORTUE, SEUIL_INDIVIDU, JournalOccupe, Registre,
-                           RegistreIllisible, Surveillance, corriger_visite, inscrire_photos, lire_journal,
-                           renommer_dans_journal, secondes)
+                           ALBUM, RegistreIllisible, Surveillance, corriger_visite, inscrire_photos, lire_journal,
+                           lire_positions, renommer_dans_journal, secondes)
 
 ICI = Path(__file__).resolve().parent
 if (ICI / "hf_cache").is_dir():     # version installée : modèles livrés avec l'installateur
@@ -101,6 +104,10 @@ class App:
         self.image_affichee = None
         self.vignettes = {}
         self.vignettes_tortues = {}
+        self.cache_vignettes = {}       # (chemin, taille, date du fichier) -> PhotoImage
+        self.fenetres_fiche = {}        # clé -> fenêtre de fiche ouverte
+        self.diffusion = None           # fenêtre plein écran pour le stream (YouTube…)
+        self.repas_du_jour = []         # [(nom, secondes)] des repas d'aujourd'hui, les plus longs d'abord
         self.photo_visite = None
         self.modeles_prets = False
         self.fermeture = False
@@ -223,6 +230,7 @@ class App:
                     font=("Segoe UI", 10))
         s.configure("Treeview.Heading", background=CARTE, foreground=DISCRET, borderwidth=0, font=("Segoe UI Semibold", 9))
         s.map("Treeview", background=[("selected", "#34452c")])
+        s.configure("Liste.Treeview", rowheight=28)     # listes sans vignette : pesées, carnet
         s.configure("TCheckbutton", background=CARTE, foreground=TEXTE)
         s.map("TCheckbutton", background=[("active", CARTE)])
         s.configure("Horizontal.TScale", background=CARTE, troughcolor=BORD)
@@ -281,8 +289,15 @@ class App:
         ttk.Button(barre, text="🐢  Ajouter une tortue", command=self.ajouter_tortue).pack(side="left", padx=(8, 0))
         ttk.Button(barre, text="📁  Dossier", command=lambda: os.startfile(self.dossier) if self.dossier.exists() else None
                    ).pack(side="left", padx=(8, 0))
-        ttk.Button(barre, text="📊  Statistiques", command=self.statistiques).pack(side="left", padx=(8, 0))
         ttk.Button(barre, text="⚙  Réglages", command=self.reglages).pack(side="right")
+        # suivi des tortues : en haut, à côté du titre, où il reste de la place
+        suivi = tk.Frame(tete, bg=FOND)
+        suivi.pack(side="left", padx=(28, 0))
+        ttk.Button(suivi, text="✅  À confirmer", style="Vert.TButton", command=self.confirmer_rapide).pack(side="left")
+        ttk.Button(suivi, text="📊  Statistiques", command=self.statistiques).pack(side="left", padx=(8, 0))
+        ttk.Button(suivi, text="🧭  Comportement", command=self.comportement).pack(side="left", padx=(8, 0))
+        ttk.Button(suivi, text="📺  Plein écran", command=self.plein_ecran).pack(side="left", padx=(8, 0))
+        r.bind("<F11>", lambda _e: self.plein_ecran())
 
         corps = tk.Frame(r, bg=FOND)
         corps.grid(row=2, column=0, sticky="nsew", padx=20)
@@ -293,6 +308,9 @@ class App:
         self.video = tk.Label(cadre_video, bg="#070a06")
         self.video.pack(fill="both", expand=True)
         self.video.bind("<Configure>", lambda e: self._afficher_vide() if self.surveillance is None else None)
+        self.zones_video = []
+        for bouton in ("<Button-1>", "<Button-3>"):
+            self.video.bind(bouton, self._menu_video)
 
         droite = tk.Frame(corps, bg=FOND, width=400)
         droite.grid(row=0, column=1, sticky="ns")
@@ -310,6 +328,10 @@ class App:
         self.lbl_individu.pack(anchor="w", pady=(10, 0))
         self.lbl_details = ttk.Label(c, text="Aucune visite pour l'instant", style="Discret.TLabel", wraplength=360)
         self.lbl_details.pack(anchor="w")
+        self.visite_affichee = None
+        for w in (self.lbl_photo, self.lbl_individu):       # clic : fiche de la tortue de cette visite
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda _e: self._fiche_visite_affichee())
 
         c = self._carte(droite, "Repas d'aujourd'hui", row=1, column=0, sticky="ew", pady=(0, 12))
         self.stats = tk.Canvas(c, bg=CARTE, height=30, highlightthickness=0)
@@ -564,7 +586,10 @@ class App:
                 donnees, self.derniere_image = self.derniere_image, None
             if donnees and self.surveillance:
                 image, etat = donnees
-                self._afficher_image(image, etat)
+                if self.diffusion is not None:      # plein écran : la fenêtre principale est cachée dessous
+                    self._afficher_diffusion(image, etat)
+                else:
+                    self._afficher_image(image, etat)
                 n = etat["presence"]
                 self.pastille.configure(text=f"●  {n} tortue{'s' if n > 1 else ''} à table" if n else "●  Surveillance",
                                         fg=ROUGE if n else VERT)
@@ -611,7 +636,7 @@ class App:
                 if self.fermeture:
                     self.root.destroy()
                     return
-                if not contenu:
+                if not contenu and self.diffusion is None:     # pas de boîte d'erreur en plein direct
                     messagebox.showerror("Source vidéo", self.lbl_etat.cget("text"))
                 self.surveillance, self.derniere_image = None, None
                 self.figee = False               # la prochaine surveillance repart d'une image vivante
@@ -709,16 +734,32 @@ class App:
         h, w = image.shape[:2]
         e = min(lw / w, lh / h)
         nw, nh = int(w * e), int(h * e)
-        img = Image.fromarray(cv2.cvtColor(cv2.resize(image, (nw, nh)), cv2.COLOR_BGR2RGB)).convert("RGBA")
-        calque = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        d = ImageDraw.Draw(calque)
-        for boite, texte in etat["tortues"]:
+        # dessin direct sur l'image RGB, transparences mélangées par ImageDraw : ni calque ni
+        # composition à chaque image (deux copies plein cadre en moins, 30 fois par seconde)
+        img = Image.fromarray(cv2.cvtColor(cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB))
+        d = ImageDraw.Draw(img, "RGBA")
+        # le Label centre l'image : décalage pour retrouver la tortue sous un clic
+        ox, oy = (self.video.winfo_width() - nw) // 2, (self.video.winfo_height() - nh) // 2
+        self.zones_video = []
+        pistes = etat.get("pistes") or [(None, b, t, True, None) for b, t in etat["tortues"]]
+        for numero, boite, texte, sure, *reste in pistes:
+            cle = reste[0] if reste else None
             x, y, bw, bh = (int(v * e) for v in boite)
-            d.rounded_rectangle([x, y, x + bw, y + bh], radius=10, outline=(217, 164, 65, 255), width=4)
+            if sure:
+                d.rounded_rectangle([x, y, x + bw, y + bh], radius=10, outline=(217, 164, 65, 255), width=4)
+            else:                       # pas encore confirmée : cadre fin, nommable d'un clic
+                d.rounded_rectangle([x, y, x + bw, y + bh], radius=10, outline=(151, 163, 141, 200), width=2)
+                texte = f"{texte} ?" if not texte.endswith("?") else texte
             tw = d.textlength(texte, font=self.f_tag)
             yt = max(0, y - 40)
             d.rounded_rectangle([x, yt, x + tw + 24, yt + 36], radius=10, fill=(16, 20, 15, 215))
-            d.text((x + 12, yt + 4), texte, font=self.f_tag, fill=(233, 238, 227, 255))
+            d.text((x + 12, yt + 4), texte, font=self.f_tag, fill=(233, 238, 227, 255 if sure else 170))
+            if numero is not None:      # cadre et étiquette cliquables
+                self.zones_video.append((ox + x, oy + yt, ox + max(x + bw, x + tw + 24), oy + y + bh, numero, texte,
+                                         cle, sure and not texte.endswith("?")))
+        if self.zones_video:
+            d.text((16, nh - 30), "Clic sur une tortue : sa fiche, ou la nommer  ·  clic droit : changer son nom",
+                   font=self.f_petit, fill=(200, 210, 200, 170))
         if etat["enregistrement"]:
             d.rounded_rectangle([16, 16, 150, 52], radius=18, fill=(248, 81, 73, 230))
             d.ellipse([28, 28, 40, 40], fill="white")
@@ -729,8 +770,11 @@ class App:
             tw = d.textlength(texte, font=self.f_petit)
             d.rounded_rectangle([(nw - tw) / 2 - 18, nh - 62, (nw + tw) / 2 + 18, nh - 18], radius=14, fill=(248, 81, 73, 235))
             d.text(((nw - tw) / 2, nh - 54), texte, font=self.f_petit, fill="white")
-        self.image_affichee = ImageTk.PhotoImage(Image.alpha_composite(img, calque).convert("RGB"))
-        self.video.configure(image=self.image_affichee)
+        if isinstance(self.image_affichee, ImageTk.PhotoImage) and self.image_affichee.width() == nw                 and self.image_affichee.height() == nh and self.video.cget("image") == str(self.image_affichee):
+            self.image_affichee.paste(img)      # même taille : on réutilise l'image Tk, sans en recréer une
+        else:
+            self.image_affichee = ImageTk.PhotoImage(img)
+            self.video.configure(image=self.image_affichee)
 
     def _afficher_vide(self):
         lw, lh = max(self.video.winfo_width(), 320), max(self.video.winfo_height(), 240)
@@ -745,6 +789,154 @@ class App:
         d.text(((lw - d.textlength(t, font=self.f_vide)) / 2, lh / 2 + 10), t, font=self.f_vide, fill=(151, 163, 141))
         self.image_affichee = ImageTk.PhotoImage(img)
         self.video.configure(image=self.image_affichee)
+
+    # -------------------------------------------------------------- plein écran (stream)
+    def plein_ecran(self):
+        """Vidéo seule, en plein écran, habillée pour être diffusée (YouTube, Twitch…) : noms des
+        tortues reconnues, « en direct », heure, repas du jour. Rien de privé ni de technique à
+        l'écran (pas de chemins, de réglages, d'i/s, de noms douteux). Échap, F11 ou double-clic
+        pour sortir ; P enregistre une photo 1920×1080 à partager (dossier « partage »)."""
+        if self.diffusion is not None:
+            self._quitter_diffusion()
+            return
+        f = tk.Toplevel(self.root, bg="black", cursor="none")
+        f.title("Broutille — en direct")
+        f.attributes("-fullscreen", True)
+        f.attributes("-topmost", True)
+        ecran = tk.Label(f, bg="black", bd=0)
+        ecran.pack(fill="both", expand=True)
+        self.diffusion, self.ecran_diffusion, self.image_diffusion = f, ecran, None
+        self.derniere_diffusion = None
+        if not hasattr(self, "f_diff"):
+            self.f_diff = {"titre": police(34, True), "nom": police(30, True), "age": police(20),
+                           "bas": police(22), "heure": police(40, True), "direct": police(20, True), "attente": police(36)}
+        for touche in ("<Escape>", "<F11>", "<Double-1>"):
+            f.bind(touche, lambda _e: self._quitter_diffusion())
+        f.bind("<KeyPress-p>", lambda _e: self._photo_diffusion())
+        f.bind("<KeyPress-P>", lambda _e: self._photo_diffusion())
+        f.focus_force()
+        f.after(200, self._diffusion_au_repos)
+
+    def _quitter_diffusion(self):
+        if self.diffusion is not None:
+            self.diffusion.destroy()
+        self.diffusion = self.image_diffusion = self.derniere_diffusion = None
+        if self.surveillance is None:
+            self._afficher_vide()
+
+    def _diffusion_au_repos(self):
+        """Sans surveillance, l'écran du stream reste propre : logo, heure, « de retour bientôt »."""
+        if self.diffusion is None or not self.diffusion.winfo_exists():
+            return
+        if self.surveillance is None:
+            lw, lh = self.diffusion.winfo_width(), self.diffusion.winfo_height()
+            img = Image.new("RGB", (max(lw, 640), max(lh, 360)), (7, 10, 6))
+            d = ImageDraw.Draw(img, "RGBA")
+            try:
+                logo = Image.open(ICI / "broutille.png").convert("RGBA").resize((200, 200), Image.LANCZOS)
+                img.paste(logo, ((img.width - 200) // 2, img.height // 2 - 230), logo)
+            except OSError:
+                pass
+            t = "La mangeoire revient dans un instant"
+            d.text((img.width / 2, img.height / 2 + 30), t, font=self.f_diff["attente"], fill=(233, 238, 227), anchor="mt")
+            self._habillage(d, img.size, en_direct=False)
+            self._montrer_diffusion(img)
+        self.diffusion.after(1000, self._diffusion_au_repos)
+
+    def _habillage(self, d, taille, en_direct=True):
+        """Bandeau commun : titre et pastille en haut à gauche, heure en haut à droite, repas du jour en bas."""
+        lw, lh = taille
+        F = self.f_diff
+        d.rounded_rectangle([24, 24, 60 + d.textlength("Broutille", font=F["titre"]), 84], radius=16, fill=(16, 20, 15, 190))
+        d.text((42, 54), "Broutille", font=F["titre"], fill=(233, 238, 227), anchor="lm")
+        if en_direct:
+            x = 76 + d.textlength("Broutille", font=F["titre"])
+            larg = d.textlength("EN DIRECT", font=F["direct"]) + 52
+            d.rounded_rectangle([x, 34, x + larg, 74], radius=20, fill=(248, 81, 73, 235))
+            d.ellipse([x + 16, 47, x + 30, 61], fill="white")
+            d.text((x + 38, 54), "EN DIRECT", font=F["direct"], fill="white", anchor="lm")
+        maintenant = datetime.now()
+        heure = maintenant.strftime("%H:%M")
+        jour = f"{maintenant.day} {fiches.MOIS[maintenant.month - 1]}"
+        lh_h = d.textlength(heure, font=F["heure"])
+        d.rounded_rectangle([lw - lh_h - 70, 24, lw - 24, 120], radius=16, fill=(16, 20, 15, 190))
+        d.text((lw - 47, 30), heure, font=F["heure"], fill=(233, 238, 227), anchor="ra")
+        d.text((lw - 47, 84), jour, font=F["age"], fill=(151, 163, 141), anchor="ra")
+        if self.repas_du_jour:
+            texte = "Aujourd'hui à table :   " + "   ·   ".join(f"{n}  {duree_lisible(s)}" for n, s in self.repas_du_jour[:4])
+        else:
+            texte = "Aujourd'hui : pas encore de repas"
+        tw = d.textlength(texte, font=F["bas"])
+        d.rounded_rectangle([24, lh - 76, 24 + tw + 40, lh - 24], radius=16, fill=(16, 20, 15, 200))
+        d.text((44, lh - 50), texte, font=F["bas"], fill=(233, 238, 227), anchor="lm")
+
+    def _afficher_diffusion(self, image, etat):
+        f = self.diffusion
+        lw, lh = max(f.winfo_width(), 640), max(f.winfo_height(), 360)
+        h, w = image.shape[:2]
+        e = min(lw / w, lh / h)
+        nw, nh = int(w * e), int(h * e)
+        video = Image.fromarray(cv2.cvtColor(cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB))
+        if (nw, nh) == (lw, lh):
+            img = video
+        else:                               # autre format que l'écran : bandes noires
+            img = Image.new("RGB", (lw, lh))
+            img.paste(video, ((lw - nw) // 2, (lh - nh) // 2))
+        ox, oy = (lw - nw) // 2, (lh - nh) // 2
+        d = ImageDraw.Draw(img, "RGBA")
+        F = self.f_diff
+        connues = self.registre.fiches
+        for numero, boite, texte, sure, *reste in etat.get("pistes") or [(None, b, t, True) for b, t in etat["tortues"]]:
+            if not sure:
+                continue                    # douteuse : rien à l'écran tant qu'elle n'est pas confirmée
+            cle = reste[0] if reste else None
+            fiche = connues.get(cle) if cle and not texte.endswith("?") else None
+            nom = fiche["nom"] if fiche else "Tortue"
+            age = fiches.age_lisible(fiche.get("naissance", "")) if fiche else ""
+            x, y, bw, bh = (int(v * e) for v in boite)
+            x, y = x + ox, y + oy
+            d.rounded_rectangle([x, y, x + bw, y + bh], radius=14, outline=(217, 164, 65, 255), width=4)
+            tw = max(d.textlength(nom, font=F["nom"]), d.textlength(age, font=F["age"]) if age else 0)
+            ht = 76 if age else 50
+            yt = max(0, y - ht - 8)
+            d.rounded_rectangle([x, yt, x + tw + 32, yt + ht], radius=14, fill=(16, 20, 15, 215))
+            d.text((x + 16, yt + 6), nom, font=F["nom"], fill=(233, 238, 227))
+            if age:
+                d.text((x + 16, yt + 46), age, font=F["age"], fill=(217, 164, 65))
+        if etat.get("figee_s"):             # direct coupé côté caméra : message aux spectateurs
+            t = "Le direct revient dans un instant"
+            tw = d.textlength(t, font=F["attente"])
+            d.rounded_rectangle([(lw - tw) / 2 - 30, lh / 2 - 40, (lw + tw) / 2 + 30, lh / 2 + 40], radius=20,
+                                fill=(16, 20, 15, 220))
+            d.text((lw / 2, lh / 2), t, font=F["attente"], fill=(233, 238, 227), anchor="mm")
+        self._habillage(d, (lw, lh))
+        self._montrer_diffusion(img)
+
+    def _montrer_diffusion(self, img):
+        self.derniere_diffusion = img
+        i = self.image_diffusion
+        if i is not None and (i.width(), i.height()) == img.size:
+            i.paste(img)
+        else:
+            self.image_diffusion = ImageTk.PhotoImage(img)
+            self.ecran_diffusion.configure(image=self.image_diffusion)
+
+    def _photo_diffusion(self):
+        """Image du stream en 1920×1080, prête pour les réseaux sociaux."""
+        if self.derniere_diffusion is None:
+            return
+        d = self.dossier / "partage"
+        d.mkdir(parents=True, exist_ok=True)
+        img = self.derniere_diffusion.copy()
+        img.thumbnail((1920, 1080), Image.LANCZOS)
+        fond = Image.new("RGB", (1920, 1080))
+        fond.paste(img, ((1920 - img.width) // 2, (1080 - img.height) // 2))
+        chemin = d / f"broutille_{datetime.now():%Y-%m-%d_%H-%M-%S}.jpg"
+        fond.save(chemin, quality=92)
+        self.lbl_etat.configure(text=f"Photo à partager : {chemin.name} (dossier « partage »)")
+        flash = tk.Frame(self.diffusion, bg="white")       # petit éclair : la photo est prise
+        flash.place(relwidth=1, relheight=1)
+        self.diffusion.after(80, flash.destroy)
 
     # -------------------------------------------------------------- visites
     def charger_historique(self):
@@ -764,12 +956,22 @@ class App:
         self._maj_tortues()
 
     def _vignette(self, chemin, taille):
+        """Vignette mise en cache : l'historique et les fiches se redessinent sans relire les photos."""
         try:
-            img = Image.open(chemin)
-            img.thumbnail(taille)
-            return ImageTk.PhotoImage(img)
-        except OSError:
+            cle = (str(chemin), taille, os.stat(chemin).st_mtime_ns)
+            if cle in self.cache_vignettes:
+                return self.cache_vignettes[cle]
+            with Image.open(chemin) as img:
+                img.draft("RGB", (taille[0] * 2, taille[1] * 2))   # JPEG décodé directement en petit
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail(taille)
+                vignette = ImageTk.PhotoImage(img)
+        except (OSError, ValueError):
             return None
+        if len(self.cache_vignettes) > 1500:
+            self.cache_vignettes.clear()
+        self.cache_vignettes[cle] = vignette
+        return vignette
 
     def _ajouter_visite(self, ligne, en_tete):
         aujourd_hui = datetime.now().strftime("%Y-%m-%d")
@@ -782,14 +984,24 @@ class App:
             self.vignettes[iid] = vignette
         self.lignes[iid] = ligne
 
+    def _fiche_visite_affichee(self):
+        l = self.visite_affichee or {}
+        cle = l.get("id_individu") or l.get("id_proposition")
+        if cle in self.registre.fiches:
+            self.fiche_tortue(cle)
+
     def _afficher_visite(self, ligne):
+        self.visite_affichee = ligne
         self.photo_visite = self._vignette(self.dossier / ligne["photo"], (370, 150)) if ligne.get("photo") else None
         self.lbl_photo.configure(image=self.photo_visite or "")
         nom = f"{ligne['proposition']} ?" if ligne.get("proposition") else ligne["individu"]
         self.lbl_individu.configure(text=nom, foreground=DISCRET if ligne["individu"] == INCONNUE else TEXTE)
         quand = f"{ligne['date'][8:]}/{ligne['date'][5:7]} à {ligne['heure'][:5]}"
         origine = {"manuel": "  ·  corrigée à la main", "nouvelle": "  ·  nouvelle tortue"}.get(ligne.get("source"), "")
-        self.lbl_details.configure(text=f"{ligne['espece']}  ·  {quand}  ·  {duree_lisible(secondes(ligne))}{origine}")
+        fiche = self.registre.fiches.get(ligne.get("id_individu"))
+        identite = fiches.resume_identite(fiche) if fiche else ligne["espece"]
+        self.lbl_details.configure(text=f"{identite}\n{quand}  ·  {duree_lisible(secondes(ligne))}{origine}"
+                                        + ("  ·  clic : sa fiche" if fiche else ""))
 
     def _selection(self, _):
         sel = self.arbre.selection()
@@ -810,6 +1022,9 @@ class App:
         self.arbre.selection_set(iid)
         ligne = self.lignes[iid]
         menu = tk.Menu(self.root, tearoff=0)
+        if ligne.get("id_individu") in self.registre.fiches:
+            menu.add_command(label=f"🐢  Fiche de {ligne['individu']}…", command=lambda: self.fiche_tortue(ligne["id_individu"]))
+            menu.add_separator()
         if ligne.get("id_proposition") in self.registre.fiches:
             menu.add_command(label=f"✔  Oui, c'est {ligne['proposition']}", command=lambda: self._corriger(ligne, ligne["id_proposition"]))
             menu.add_separator()
@@ -821,6 +1036,47 @@ class App:
         menu.add_command(label="Nouvelle tortue…", command=lambda: self._corriger_nouvelle(ligne))
         menu.add_command(label=PAS_UNE_TORTUE, command=lambda: self._pas_une_tortue(ligne))
         menu.tk_popup(evenement.x_root, evenement.y_root)
+
+    def _menu_video(self, evenement):
+        """Clic sur une tortue de la vidéo en direct : tortue reconnue → sa fiche ; douteuse ou
+        clic droit → menu pour la nommer (avec sa fiche en tête si on a une idée de qui c'est)."""
+        if not self.surveillance:
+            return
+        zone = next((z for z in reversed(self.zones_video)
+                     if z[0] <= evenement.x <= z[2] and z[1] <= evenement.y <= z[3]), None)
+        if zone is None:
+            return
+        numero, texte = zone[4], zone[5]
+        cle = zone[6] if len(zone) > 6 and zone[6] in self.registre.fiches else None
+        if cle and zone[7] and evenement.num == 1:
+            self.fiche_tortue(cle)
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        if cle:
+            menu.add_command(label=f"🐢  Fiche de {self.registre.fiches[cle]['nom']}…", command=lambda: self.fiche_tortue(cle))
+            menu.add_separator()
+        menu.add_command(label=f"{texte} — cette tortue est :", state="disabled")
+        connues = sorted(self.registre.copie_fiches().items(), key=lambda x: (x[1].get("provisoire", False), x[1]["nom"]))
+        for autre, fiche in connues:
+            menu.add_command(label=fiche["nom"], command=lambda c=autre: self._nommer_piste(numero, c))
+        menu.add_separator()
+        menu.add_command(label="Nouvelle tortue…", command=lambda: self._nommer_piste_nouvelle(numero))
+        menu.add_command(label=PAS_UNE_TORTUE, command=lambda: self._nommer_piste(numero, PAS_UNE_TORTUE))
+        menu.tk_popup(evenement.x_root, evenement.y_root)
+
+    def _nommer_piste(self, numero, cle):
+        surveillance = self.surveillance
+        if surveillance is None:
+            return
+        if not surveillance.nommer_piste(numero, cle):
+            self.lbl_etat.configure(text="Cette tortue vient de partir : corrigez sa visite dans l'historique (clic droit)")
+
+    def _nommer_piste_nouvelle(self, numero):
+        resultat = self._dialogue_tortue("Nouvelle tortue")
+        if resultat:
+            cle = self.registre.creer(*resultat)
+            self._maj_tortues()
+            self._nommer_piste(numero, cle)
 
     def _pas_une_tortue(self, ligne):
         if messagebox.askyesno(PAS_UNE_TORTUE, "Effacer cette visite, son clip et ses photos ?\n"
@@ -859,10 +1115,12 @@ class App:
         c.delete("all")
         largeur = max(c.winfo_width(), 360)
         if not temps:
+            self.repas_du_jour = []
             c.configure(height=30)
             c.create_text(0, 14, anchor="w", text="Pas encore de repas aujourd'hui", fill=DISCRET, font=("Segoe UI", 10))
             return
         top = sorted(temps.items(), key=lambda x: -x[1])[:5]
+        self.repas_du_jour = [(n, s) for n, s in top if n != INCONNUE]
         c.configure(height=26 * len(top))
         maxi = top[0][1] or 1
         for i, (nom, s) in enumerate(top):
@@ -891,9 +1149,8 @@ class App:
         limite = (datetime.now() - timedelta(days=self.cfg["alerte_jours"])).strftime("%Y-%m-%d")
         limite_pesee = (datetime.now() - timedelta(days=self.cfg["rappel_pesee_jours"])).strftime("%Y-%m-%d")
         for cle, fiche in sorted(self.registre.copie_fiches().items(), key=lambda x: (x[1].get("provisoire", False), x[1]["nom"])):
-            d = self.registre.dossier / cle
-            photos = sorted(d.glob("*.jpg")) if d.exists() else []
-            vignette = self._vignette(photos[0], (64, 48)) if photos else None
+            portrait = self.registre.photo_profil(cle)
+            vignette = self._vignette(portrait, (64, 48)) if portrait else None
             vue = derniere.get(cle, "")
             pesee = max((p["date"] for p in fiche.get("pesees", [])), default="")
             a_peser = bool(self.cfg["rappel_pesee_jours"]) and not fiche.get("provisoire") and pesee < limite_pesee
@@ -940,8 +1197,9 @@ class App:
                                                      "Plusieurs vues aident : face, deux profils, dessus."):
             self._importer_photos(cle)
 
-    def _importer_photos(self, cle):
-        chemins = filedialog.askopenfilenames(title="Photos de la tortue", filetypes=[("Photos", "*.jpg *.jpeg *.png")])
+    def _importer_photos(self, cle, chemins=None):
+        chemins = chemins or filedialog.askopenfilenames(title="Photos de la tortue",
+                                                         filetypes=[("Photos", "*.jpg *.jpeg *.png")])
         if not chemins:
             return
 
@@ -962,9 +1220,11 @@ class App:
         fiche = self.registre.fiches[cle]
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=f"{fiche['nom']} — {fiche['espece']}", state="disabled")
-        menu.add_command(label="Nommer / changer l'espèce…", command=lambda: self._modifier_tortue(cle))
-        menu.add_command(label="Ajouter des photos…", command=lambda: self._importer_photos(cle))
-        menu.add_command(label="⚖  Pesées et courbe de poids…", command=lambda: self.pesees(cle))
+        menu.add_command(label="🐢  Fiche complète (naissance, sexe, notes)…", command=lambda: self.fiche_tortue(cle))
+        menu.add_command(label="⚖  Poids…", command=lambda: self.fiche_tortue(cle, 1))
+        menu.add_command(label="🖼  Photos…", command=lambda: self.fiche_tortue(cle, 2))
+        menu.add_command(label="📒  Carnet de soins…", command=lambda: self.fiche_tortue(cle, 3))
+        menu.add_command(label="Apprendre des photos pour la reconnaissance…", command=lambda: self._importer_photos(cle))
         menu.add_command(label="📊  Repas sur 30 jours…", command=lambda: self.statistiques(cle))
         menu.add_command(label="📄  Fiche pour le vétérinaire (PDF)…", command=lambda: self.fiche_veterinaire(cle))
         fusion = tk.Menu(menu, tearoff=0)
@@ -1012,8 +1272,8 @@ class App:
 
     def _ouvrir_galerie(self, evenement):
         cle = self.arbre_t.identify_row(evenement.y)
-        if cle and (self.registre.dossier / cle).exists():
-            os.startfile(self.registre.dossier / cle)
+        if cle:
+            self.fiche_tortue(cle)
 
     # -------------------------------------------------------------- statistiques
     def statistiques(self, choisie=None):
@@ -1088,6 +1348,263 @@ class App:
             a.see(choisie)
             montrer()
 
+    # -------------------------------------------------------------- confirmation rapide
+    def confirmer_rapide(self):
+        """Les visites non nommées, une par une : Entrée = « Oui, c'est Zoé », 1 à 9 = une tortue,
+        Espace = passer. Chaque réponse est une correction ordinaire (galerie, journal)."""
+        try:
+            journal = lire_journal(self.dossier)
+        except (JournalOccupe, OSError) as e:
+            messagebox.showerror("À confirmer", f"Journal illisible pour l'instant : {e}")
+            return
+        file = [l for l in sorted(journal, key=lambda l: (l["date"], l["heure"]), reverse=True)
+                if not l.get("id_individu")]
+        if not file:
+            messagebox.showinfo("À confirmer", "Toutes les visites sont nommées. Bravo !")
+            return
+        f = tk.Toplevel(self.root, bg=CARTE, padx=18, pady=14)
+        f.title("À confirmer")
+        f.transient(self.root)
+        etat = {"i": 0, "faites": 0}
+        compteur = ttk.Label(f, style="Discret.TLabel")
+        compteur.pack(anchor="w")
+        images = tk.Frame(f, bg=CARTE)
+        images.pack(fill="x", pady=(8, 0))
+        lbl_tortue, lbl_scene = tk.Label(images, bg=CARTE), tk.Label(images, bg=CARTE)
+        lbl_tortue.pack(side="left")
+        lbl_scene.pack(side="left", padx=(14, 0))
+        details = ttk.Label(f, style="Carte.TLabel")
+        details.pack(anchor="w", pady=(8, 0))
+        choix = tk.Frame(f, bg=CARTE)
+        choix.pack(fill="x", pady=(10, 0))
+        bas = tk.Frame(f, bg=CARTE)
+        bas.pack(fill="x", pady=(12, 0))
+
+        def charger(chemin, taille):
+            try:
+                img = Image.open(chemin)
+                img.thumbnail(taille)
+                return ImageTk.PhotoImage(img)
+            except OSError:
+                return None
+
+        def repondre(cle):
+            ligne = file[etat["i"]]
+            if cle is not None:
+                self._corriger(ligne, cle)
+                etat["faites"] += 1
+            etat["i"] += 1
+            montrer()
+
+        def nouvelle():
+            ligne = file[etat["i"]]
+            resultat = self._dialogue_tortue("Nouvelle tortue", espece=ligne["espece"])
+            if resultat:
+                repondre(self.registre.creer(*resultat))
+                self._maj_tortues()
+
+        def montrer():
+            for w in choix.winfo_children() + bas.winfo_children():
+                w.destroy()
+            for touche in [str(k) for k in range(1, 10)] + ["<Return>", "<space>"]:
+                f.unbind(touche)
+            if etat["i"] >= len(file):
+                compteur.configure(text=f"Terminé : {etat['faites']} visites nommées.")
+                for lbl in (lbl_tortue, lbl_scene):
+                    lbl.configure(image="")
+                details.configure(text="Merci ! Broutille retient ces images pour mieux reconnaître vos tortues.")
+                ttk.Button(bas, text="Fermer", style="Vert.TButton", command=f.destroy).pack(side="right")
+                return
+            ligne = file[etat["i"]]
+            compteur.configure(text=f"Visite {etat['i'] + 1} sur {len(file)}  ·  {etat['faites']} nommées")
+            base = self.dossier / ligne["id_visite"]
+            lbl_tortue.image = charger(f"{base}_tortue.jpg", (300, 300))
+            lbl_scene.image = charger(f"{base}_photo.jpg", (420, 300))
+            lbl_tortue.configure(image=lbl_tortue.image or "", text="" if lbl_tortue.image else "photo effacée par le ménage",
+                                 fg=DISCRET)
+            lbl_scene.configure(image=lbl_scene.image or "")
+            details.configure(text=f"{ligne['date'][8:]}/{ligne['date'][5:7]} à {ligne['heure'][:5]}  ·  "
+                                   f"{duree_lisible(secondes(ligne))}  ·  {ligne['espece']}")
+            fiches = sorted(self.registre.copie_fiches().items(), key=lambda x: (x[1].get("provisoire", False), x[1]["nom"]))
+            proposee = ligne.get("id_proposition") if ligne.get("id_proposition") in self.registre.fiches else None
+            if proposee:
+                ttk.Button(choix, text=f"✔  Oui, c'est {self.registre.fiches[proposee]['nom']}   (Entrée)", style="Vert.TButton",
+                           command=lambda: repondre(proposee)).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+                f.bind("<Return>", lambda _e: repondre(proposee))
+            for k, (cle, fiche) in enumerate(fiches):
+                raccourci = f"   ({k + 1})" if k < 9 else ""
+                ttk.Button(choix, text=fiche["nom"] + raccourci, command=lambda c=cle: repondre(c)
+                           ).grid(row=1 + k // 3, column=k % 3, sticky="we", padx=(0, 6), pady=2)
+                if k < 9:
+                    f.bind(str(k + 1), lambda _e, c=cle: repondre(c))
+            ttk.Button(bas, text="Nouvelle tortue…", command=nouvelle).pack(side="left")
+            ttk.Button(bas, text="Pas une tortue (efface la visite)", command=lambda: repondre(PAS_UNE_TORTUE)
+                       ).pack(side="left", padx=8)
+            if ligne.get("video") and (self.dossier / ligne["video"]).exists():
+                ttk.Button(bas, text="▶  Clip", command=lambda: os.startfile(self.dossier / ligne["video"])).pack(side="left")
+            ttk.Button(bas, text="Passer   (Espace)", command=lambda: repondre(None)).pack(side="right")
+            f.bind("<space>", lambda _e: repondre(None))
+
+        f.focus_set()
+        montrer()
+
+    # -------------------------------------------------------------- comportement
+    def comportement(self):
+        """Rythme, réseau social, dominance et santé, tirés du journal des visites."""
+        f = tk.Toplevel(self.root, bg=CARTE, padx=16, pady=14)
+        f.title("Comportement des tortues")
+        f.transient(self.root)
+        try:
+            journal = lire_journal(self.dossier)
+        except (JournalOccupe, OSError):
+            journal = []
+        noms = comportement.noms(journal)
+        noms.update({c: fi["nom"] for c, fi in self.registre.copie_fiches().items()})
+        nom = lambda c: noms.get(c, c)
+        couleurs = dict(fond=(27, 33, 25), encre=(233, 238, 227), discret=(151, 163, 141))
+
+        haut = tk.Frame(f, bg=CARTE)
+        haut.pack(fill="x")
+        ttk.Label(haut, text="Période :", style="Carte.TLabel").pack(side="left")
+        periodes = {"30 jours": 30, "90 jours": 90, "1 an": 365, "Tout": None}
+        v_periode = tk.StringVar(value="30 jours")
+        ttk.Combobox(haut, textvariable=v_periode, values=list(periodes), state="readonly", width=10).pack(side="left", padx=8)
+        info = ttk.Label(haut, style="Discret.TLabel")
+        info.pack(side="left", padx=8)
+        onglets = ttk.Notebook(f)
+        onglets.pack(fill="both", expand=True, pady=(10, 0))
+        pages = {}
+        positions = lire_positions(self.dossier)
+        photos = sorted(self.dossier.glob("*_photo.jpg"))
+        try:
+            fond_zones = Image.open(photos[-1]) if photos else None
+        except OSError:
+            fond_zones = None
+        for titre in ("Rythme", "Réseau social", "Dominance", "Déplacements", "Santé"):
+            pages[titre] = tk.Frame(onglets, bg=CARTE, padx=8, pady=8)
+            onglets.add(pages[titre], text=titre)
+
+        def tableau(parent, colonnes, lignes, rouges=()):
+            a = ttk.Treeview(parent, columns=[c[0] for c in colonnes], show="headings", height=min(10, max(3, len(lignes))))
+            for col, titre, larg in colonnes:
+                a.heading(col, text=titre, anchor="w")
+                a.column(col, width=larg, anchor="w")
+            a.tag_configure("rouge", foreground=ROUGE)
+            for i, valeurs in enumerate(lignes):
+                a.insert("", "end", values=valeurs, tags=("rouge",) if i in rouges else ())
+            a.pack(fill="x", pady=(8, 0))
+
+        def image(parent, img):
+            lbl = tk.Label(parent, bg=CARTE)
+            lbl.image = ImageTk.PhotoImage(img)
+            lbl.configure(image=lbl.image)
+            lbl.pack(anchor="w")
+
+        def remplir(_=None):
+            for page in pages.values():
+                for w in page.winfo_children():
+                    w.destroy()
+            s = comportement.sejours(journal, periodes[v_periode.get()])
+            jours = len({d.date() for _c, d, _f in s})
+            info.configure(text=f"{len(s)} visites nommées sur {jours} jours"
+                                + ("  —  encore peu de données : tendances à confirmer" if jours < 14 else ""))
+            if not s:
+                for page in pages.values():
+                    ttk.Label(page, text="Pas encore de visite nommée sur cette période.", style="Carte.TLabel").pack()
+                return
+            # rythme
+            r = comportement.rythme(s)
+            image(pages["Rythme"], comportement.image_rythme(r, noms, chaud=(127, 185, 80), **couleurs))
+            reg = comportement.regularite(s)
+            tableau(pages["Rythme"], (("nom", "TORTUE", 170), ("arrivee", "ARRIVÉE MOYENNE", 140),
+                                      ("ecart", "RÉGULARITÉ (± min)", 150), ("jours", "JOURS VENUE", 100)),
+                    [(nom(c), comportement.heure_lisible(v["arrivee_moy"]), f"± {v['ecart_min']:.0f}", v["jours"])
+                     for c, v in sorted(reg.items(), key=lambda x: x[1]["arrivee_moy"])])
+            # réseau social
+            reseau = comportement.reseau_social(s)
+            totaux = {c: sum(v) for c, v in r.items()}
+            image(pages["Réseau social"], comportement.image_reseau(reseau, totaux, noms, trait=(127, 185, 80),
+                                                                    filet=(70, 84, 64), **couleurs))
+            tableau(pages["Réseau social"], (("a", "TORTUE", 150), ("b", "AVEC", 150), ("fois", "REPAS PARTAGÉS", 120),
+                                             ("temps", "ENSEMBLE", 100), ("aff", "AFFINITÉ", 90)),
+                    [(nom(a), nom(b), v["fois"], duree_lisible(v["ensemble_s"]),
+                      f"{v['affinite']:.0%}" if v["affinite"] >= 0.005 else "< 1 %")
+                     for (a, b), v in sorted(reseau.items(), key=lambda x: -x[1]["affinite"])])
+            ttk.Label(pages["Réseau social"], style="Discret.TLabel", text="Affinité : part du temps à table où les deux "
+                      "sont là ensemble. Trait épais : elles mangent souvent ensemble.").pack(anchor="w", pady=(6, 0))
+            # dominance
+            comptes, classement = comportement.dominance(s)
+            ttk.Label(pages["Dominance"], style="Carte.TLabel", text="Une tortue arrive, l'autre part dans la minute : "
+                      "elle l'a sans doute fait partir.").pack(anchor="w")
+            tableau(pages["Dominance"], (("rang", "RANG", 50), ("nom", "TORTUE", 170), ("g", "FAIT PARTIR", 100),
+                                         ("p", "PARTIE", 80), ("score", "DOMINANCE", 100)),
+                    [(i + 1, nom(c), g, p, f"{sc:.0%}") for i, (c, g, p, sc) in enumerate(classement)])
+            tableau(pages["Dominance"], (("g", "QUI", 170), ("p", "FAIT PARTIR QUI", 170), ("n", "FOIS", 80)),
+                    [(nom(g), nom(p), n) for (g, p), n in sorted(comptes.items(), key=lambda x: -x[1])])
+            ttk.Label(pages["Dominance"], style="Discret.TLabel", text="Un indice, pas une preuve : une tortue peut "
+                      "aussi partir parce qu'elle a fini. Il devient fiable avec des dizaines de rencontres."
+                      ).pack(anchor="w", pady=(6, 0))
+            # déplacements : positions notées à chaque analyse pendant les visites
+            page = pages["Déplacements"]
+            tr = deplacements.trajets(journal, positions, periodes[v_periode.get()])
+            if not tr:
+                ttk.Label(page, style="Carte.TLabel", text="Pas encore de positions sur cette période.\nBroutille les note "
+                          "depuis cette version, à chaque visite nommée : revenez après quelques repas.").pack(anchor="w")
+            else:
+                ligne_haut = tk.Frame(page, bg=CARTE)
+                ligne_haut.pack(fill="x")
+                ttk.Label(ligne_haut, text="Zones de", style="Carte.TLabel").pack(side="left")
+                presentes = sorted({c for c, _p in tr}, key=nom)
+                choix = {"toutes les tortues": None, **{nom(c): c for c in presentes}}
+                v_qui = tk.StringVar(value="toutes les tortues")
+                ttk.Combobox(ligne_haut, textvariable=v_qui, values=list(choix), state="readonly", width=20
+                             ).pack(side="left", padx=8)
+                lbl_zones = tk.Label(page, bg=CARTE)
+                lbl_zones.pack(anchor="w", pady=(6, 0))
+
+                def zones(*_):
+                    carte, rapport = deplacements.carte_zones(tr, choix[v_qui.get()])
+                    lbl_zones.image = ImageTk.PhotoImage(deplacements.image_zones(carte, rapport, fond_zones, 560))
+                    lbl_zones.configure(image=lbl_zones.image)
+
+                v_qui.trace_add("write", zones)
+                zones()
+                act = deplacements.activite(tr)
+                tableau(page, (("nom", "TORTUE", 150), ("vue", "OBSERVÉE", 90), ("dist", "PARCOURU", 130),
+                               ("rythme", "PAR MINUTE", 110), ("bouge", "EN MOUVEMENT", 110)),
+                        [(nom(c), duree_lisible(v["minutes"] * 60), f"{v['distance']:.0f} carapaces",
+                          f"{v['par_minute']:.1f}", f"{v['mouvement']:.0%}")
+                         for c, v in sorted(act.items(), key=lambda x: -x[1]["par_minute"])])
+                inter = deplacements.interactions(tr)
+                lignes_i = []
+                for (a, b), v in sorted(inter.items(), key=lambda x: -x[1]["contact_s"]):
+                    poursuites = ", ".join(f"{nom(q)} suit {nom(b if q == a else a)} ×{n}" for q, n in v["poursuites"].items())
+                    lignes_i.append((f"{nom(a)} et {nom(b)}", duree_lisible(v["contact_s"]), v["chevauchements"],
+                                     poursuites or "—"))
+                if lignes_i:
+                    tableau(page, (("paire", "ENSEMBLE", 220), ("contact", "AU CONTACT", 100),
+                                   ("dessus", "L'UNE SUR L'AUTRE", 130), ("pours", "POURSUITES", 300)), lignes_i)
+                ttk.Label(page, style="Discret.TLabel", text="Distances en longueurs de carapace. « L'une sur l'autre » : "
+                          "monte, ou coup de bélier ; regardez le clip. Positions toutes les 1 à 5 s : une poursuite "
+                          "rapide peut échapper.").pack(anchor="w", pady=(6, 0))
+            # santé : toujours par rapport à aujourd'hui, toutes visites comprises
+            sa = comportement.sante(comportement.sejours(journal))
+            lignes = sorted(sa.items(), key=lambda x: (not x[1]["alertes"], nom(x[0])))
+            tableau(pages["Santé"], (("nom", "TORTUE", 160), ("sem", "7 DERNIERS JOURS", 130), ("ref", "HABITUDE", 100),
+                                     ("abs", "DERNIÈRE VISITE", 120), ("alerte", "À SURVEILLER", 330)),
+                    [(nom(c), f"{v['semaine_min_j']:.0f} min/j",
+                      f"{v['ref_min_j']:.0f} min/j" if v["ref_min_j"] is not None else "—",
+                      "aujourd'hui" if v["absente_j"] == 0 else f"il y a {v['absente_j']} j",
+                      " · ".join(v["alertes"]) or ("RAS" if v["ref_min_j"] is not None
+                                                   else "habitudes pas encore connues (1re semaine)")) for c, v in lignes],
+                    rouges={i for i, (_c, v) in enumerate(lignes) if v["alertes"]})
+            ttk.Label(pages["Santé"], style="Discret.TLabel", text="Habitude : les 30 jours avant la dernière semaine. "
+                      "Une baisse peut venir de la météo (froid, pluie) : comparez avec la courbe de poids."
+                      ).pack(anchor="w", pady=(6, 0))
+
+        v_periode.trace_add("write", lambda *_: remplir())
+        remplir()
+
     # -------------------------------------------------------------- relance du direct, sauvegarde
     def _relancer_direct(self, essai, serie):
         """Image figée : clic sur le bouton du lecteur appris dans les Réglages. 5 essais,
@@ -1132,6 +1649,386 @@ class App:
         if self.root.winfo_exists():
             self.root.after(3600 * 1000, self._sauvegarde_auto)     # revérifié toutes les heures
 
+    # -------------------------------------------------------------- fiche complète
+    def fiche_tortue(self, cle, onglet=0):
+        """Tout sur une tortue, modifiable à tout moment : identité (naissance, sexe…), poids,
+        album photo et vues de reconnaissance, carnet de soins. Une seule fenêtre par tortue."""
+        cle = self.registre.resoudre(cle)
+        if not cle:
+            return
+        ouverte = self.fenetres_fiche.get(cle)
+        if ouverte is not None and ouverte.winfo_exists():
+            ouverte.deiconify()
+            ouverte.lift()
+            ouverte.onglets.select(onglet)
+            return
+        f = tk.Toplevel(self.root, bg=CARTE, padx=18, pady=14)
+        self.fenetres_fiche[cle] = f
+        f.transient(self.root)
+        f.geometry("1000x780")
+        f.minsize(880, 660)
+        try:
+            journal = [l for l in lire_journal(self.dossier) if l.get("id_individu") == cle]
+        except (JournalOccupe, OSError):
+            journal = []
+
+        # --- bandeau : portrait, nom, identité en une ligne, chiffres clés
+        tete = tk.Frame(f, bg=CARTE)
+        tete.pack(fill="x", pady=(0, 12))
+        cadre_portrait = tk.Frame(tete, bg=FOND, width=150, height=150, cursor="hand2")
+        cadre_portrait.pack(side="left")
+        cadre_portrait.pack_propagate(False)
+        portrait = tk.Label(cadre_portrait, bg=FOND, fg=DISCRET, font=("Segoe UI", 9), cursor="hand2")
+        portrait.pack(fill="both", expand=True)
+        textes = tk.Frame(tete, bg=CARTE)
+        textes.pack(side="left", padx=18, fill="both", expand=True)
+        lbl_nom = tk.Label(textes, bg=CARTE, fg=TEXTE, font=("Segoe UI Semibold", 24))
+        lbl_nom.pack(anchor="w")
+        lbl_resume = tk.Label(textes, bg=CARTE, fg=AMBRE, font=("Segoe UI Semibold", 12))
+        lbl_resume.pack(anchor="w")
+        lbl_chiffres = tk.Label(textes, bg=CARTE, fg=DISCRET, font=("Segoe UI", 10), justify="left")
+        lbl_chiffres.pack(anchor="w", pady=(8, 0))
+        boutons = tk.Frame(tete, bg=CARTE)
+        boutons.pack(side="right", anchor="n")
+        ttk.Button(boutons, text="📊  Repas", command=lambda: self.statistiques(cle)).pack(fill="x")
+        ttk.Button(boutons, text="📄  PDF vétérinaire", command=lambda: self.fiche_veterinaire(cle)).pack(fill="x", pady=(6, 0))
+
+        def bandeau():
+            fi = self.registre.copie_fiches().get(cle)
+            if not fi:
+                return
+            f.title(f"Fiche de {fi['nom']}")
+            lbl_nom.configure(text=fi["nom"])
+            lbl_resume.configure(text=fiches.resume_identite(fi))
+            chiffres = [f"{len(journal)} visite{'s' if len(journal) > 1 else ''} au journal"]
+            if journal:
+                d = max(l["date"] for l in journal)
+                chiffres.append(f"dernière le {d[8:]}/{d[5:7]}/{d[:4]}")
+            b = rapports.bilan_poids(fi.get("pesees", []))
+            if b:
+                chiffres.append(f"dernier poids {rapports.poids_lisible(b['dernier']['g'])}")
+            if fi.get("arrivee"):
+                chiffres.append(f"à la maison depuis {fiches.date_lisible(fi['arrivee'])}")
+            lbl_chiffres.configure(text="   ·   ".join(chiffres) + ("\n" + fi["signes"] if fi.get("signes") else ""))
+            chemin = self.registre.photo_profil(cle)
+            portrait.image = self._vignette(chemin, (150, 150)) if chemin else None
+            portrait.configure(image=portrait.image or "", text="" if portrait.image else "Pas encore\nde photo")
+
+        onglets = ttk.Notebook(f)
+        onglets.pack(fill="both", expand=True)
+        f.onglets = onglets
+        portrait.bind("<Button-1>", lambda _e: onglets.select(2))
+
+        # --- Identité
+        ident = ttk.Frame(onglets, style="Carte.TFrame", padding=16)
+        onglets.add(ident, text="Identité")
+        v = {c: tk.StringVar() for c in ("nom", "espece", "sexe", "naissance", "arrivee", "origine", "signes")}
+        champs = (("Nom", "nom", "entree"), ("Espèce", "espece", "especes"), ("Sexe", "sexe", "sexe"),
+                  ("Date de naissance", "naissance", "date"), ("Arrivée à la maison", "arrivee", "date"),
+                  ("Origine", "origine", "entree"), ("Signes distinctifs", "signes", "entree"))
+        aides = {}
+        for rang, (texte, champ, genre) in enumerate(champs):
+            ttk.Label(ident, text=texte, style="Carte.TLabel").grid(row=rang, column=0, sticky="w", pady=5, padx=(0, 14))
+            if genre == "especes":
+                w = ttk.Combobox(ident, textvariable=v[champ], values=[x[0] for x in self.classeur.especes], width=34)
+            elif genre == "sexe":
+                w = ttk.Combobox(ident, textvariable=v[champ], values=("Inconnu", "Mâle", "Femelle"), state="readonly", width=34)
+            else:
+                w = ttk.Entry(ident, textvariable=v[champ], width=60 if champ in ("origine", "signes") else 36)
+            w.grid(row=rang, column=1, sticky="w", pady=5)
+            if genre == "date":
+                aides[champ] = ttk.Label(ident, style="Discret.TLabel")
+                aides[champ].grid(row=rang, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(ident, text="Notes", style="Carte.TLabel").grid(row=len(champs), column=0, sticky="nw", pady=5)
+        notes = tk.Text(ident, height=7, width=72, bg=FOND, fg=TEXTE, insertbackground=TEXTE, relief="flat",
+                        font=("Segoe UI", 10), wrap="word", padx=8, pady=6)
+        notes.grid(row=len(champs), column=1, columnspan=2, sticky="nsew", pady=5)
+        ident.columnconfigure(2, weight=1)
+        ident.rowconfigure(len(champs), weight=1)
+        bas = tk.Frame(ident, bg=CARTE)
+        bas.grid(row=len(champs) + 1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Label(bas, text="Dates : 15/03/2019, 03/2019 ou simplement 2019 si l'année seule est connue.",
+                  style="Discret.TLabel").pack(side="left")
+        statut = ttk.Label(bas, style="Carte.TLabel", foreground=VERT)
+        btn_enr = ttk.Button(bas, text="Enregistrer", style="Vert.TButton")
+        btn_enr.pack(side="right")
+        statut.pack(side="right", padx=12)
+
+        def remplir():
+            fi = self.registre.copie_fiches()[cle]
+            for c in ("nom", "espece", "origine", "signes"):
+                v[c].set(fi.get(c, ""))
+            v["sexe"].set(fi.get("sexe") or "Inconnu")
+            v["naissance"].set(fiches.date_saisie(fi.get("naissance", "")))
+            v["arrivee"].set(fiches.date_saisie(fi.get("arrivee", "")))
+            notes.delete("1.0", "end")
+            notes.insert("1.0", fi.get("notes", ""))
+            notes.edit_modified(False)
+
+        def lire():
+            """Valeurs saisies, prêtes à enregistrer ; ValueError si une date est fausse."""
+            valeurs = {c: v[c].get().strip() for c in ("nom", "espece", "origine", "signes")}
+            valeurs["sexe"] = "" if v["sexe"].get() == "Inconnu" else v["sexe"].get()
+            for c, nom in (("naissance", "naissance"), ("arrivee", "arrivée")):
+                try:
+                    valeurs[c] = fiches.lire_date_partielle(v[c].get())
+                except ValueError as e:
+                    raise ValueError(f"{nom} : {e}") from None
+            valeurs["notes"] = notes.get("1.0", "end").strip()
+            return valeurs
+
+        def modifiee():
+            try:
+                valeurs = lire()
+            except ValueError:
+                return True
+            fi = self.registre.copie_fiches().get(cle, {})
+            return any(valeurs[c] != fi.get(c, "") for c in valeurs)
+
+        def aide_dates(*_):
+            for c, lbl in aides.items():
+                try:
+                    valeur = fiches.lire_date_partielle(v[c].get())
+                    texte = (fiches.age_lisible(valeur) if c == "naissance" else
+                             f"depuis {fiches.age_lisible(valeur)}") if valeur else "jj/mm/aaaa, mm/aaaa ou aaaa"
+                    lbl.configure(text=texte, foreground=AMBRE if valeur else DISCRET)
+                except ValueError as e:
+                    lbl.configure(text=str(e), foreground=ROUGE)
+            statut.configure(text="")
+
+        def enregistrer(_=None):
+            try:
+                valeurs = lire()
+            except ValueError as e:
+                messagebox.showerror("Fiche", f"Pas enregistré — {e}", parent=f)
+                return False
+            if not valeurs["nom"]:
+                messagebox.showerror("Fiche", "Le nom ne peut pas être vide.", parent=f)
+                return False
+            fi = self.registre.copie_fiches()[cle]
+            renomme = (valeurs["nom"], valeurs["espece"]) != (fi["nom"], fi["espece"])
+            if renomme:
+                if not self._journal_libre(renommer_dans_journal, self.dossier, cle, valeurs["nom"], valeurs["espece"]):
+                    return False
+                valeurs["provisoire"] = False
+            self.registre.modifier(cle, **valeurs)
+            notes.edit_modified(False)
+            bandeau()
+            if renomme:
+                self.charger_historique()
+            else:
+                self._maj_tortues()
+            statut.configure(text="Enregistré ✓")
+            return True
+
+        btn_enr.configure(command=enregistrer)
+        for c in ("naissance", "arrivee"):
+            v[c].trace_add("write", aide_dates)
+        f.bind("<Control-s>", enregistrer)
+
+        # --- Poids
+        cadre_poids = ttk.Frame(onglets, style="Carte.TFrame", padding=12)
+        onglets.add(cadre_poids, text="Poids")
+        self._panneau_pesees(cadre_poids, cle, taille=(920, 270), apres=lambda: (bandeau(), self._maj_tortues()))
+
+        # --- Photos : album souvenir + vues apprises par la reconnaissance
+        cadre_photos = ttk.Frame(onglets, style="Carte.TFrame", padding=12)
+        onglets.add(cadre_photos, text="Photos")
+        barre = tk.Frame(cadre_photos, bg=CARTE)
+        barre.pack(fill="x")
+        v_reco = tk.BooleanVar(value=False)
+        btn_ajout = ttk.Button(barre, text="➕  Ajouter des photos…", style="Vert.TButton")
+        btn_ajout.pack(side="left")
+        ttk.Checkbutton(barre, text="Les apprendre aussi pour la reconnaissance (tortue bien visible)",
+                        variable=v_reco).pack(side="left", padx=12)
+        ttk.Button(barre, text="📁  Dossier", command=lambda: os.startfile(self.registre.dossier / cle)
+                   if (self.registre.dossier / cle).exists() else None).pack(side="right")
+        defile = tk.Canvas(cadre_photos, bg=CARTE, highlightthickness=0)
+        barre_def = ttk.Scrollbar(cadre_photos, orient="vertical", command=defile.yview)
+        defile.configure(yscrollcommand=barre_def.set)
+        barre_def.pack(side="right", fill="y", pady=(10, 0))
+        defile.pack(fill="both", expand=True, pady=(10, 0))
+        grille = tk.Frame(defile, bg=CARTE)
+        defile.create_window(0, 0, window=grille, anchor="nw")
+        grille.bind("<Configure>", lambda _e: defile.configure(scrollregion=defile.bbox("all")))
+        defile.bind("<MouseWheel>", lambda e: defile.yview_scroll(-e.delta // 120, "units"))
+        etat_photos = {"tour": 0}
+
+        def menu_photo(ev, chemin, album):
+            m = tk.Menu(f, tearoff=0)
+            m.add_command(label="Ouvrir", command=lambda: os.startfile(chemin))
+            relatif = f"{ALBUM}/{chemin.name}" if album else chemin.name
+            m.add_command(label="Choisir comme photo de profil",
+                          command=lambda: (self.registre.modifier(cle, profil=relatif), bandeau(), self._maj_tortues()))
+            m.add_separator()
+            if album:
+                m.add_command(label="Retirer de l'album…", command=lambda: retirer(chemin, True))
+            else:
+                m.add_command(label="Retirer de la reconnaissance (mauvaise vue)…", command=lambda: retirer(chemin, False))
+            m.tk_popup(ev.x_root, ev.y_root)
+
+        def retirer(chemin, album):
+            question = "Retirer cette photo de l'album ? Elle est effacée du disque." if album else \
+                "Retirer cette vue ? Broutille ne s'en servira plus pour reconnaître la tortue."
+            if not messagebox.askyesno("Photos", question, parent=f):
+                return
+            if album:
+                self.registre.retirer_album(cle, chemin.name)
+            else:
+                self.registre.retirer_vue(cle, chemin.name)
+            bandeau()
+            photos()
+            self._maj_tortues()
+
+        def photos():
+            """Reconstruit les deux grilles ; les vignettes arrivent par paquets pour garder la main."""
+            etat_photos["tour"] += 1
+            tour = etat_photos["tour"]
+            for w in grille.winfo_children():
+                w.destroy()
+            album = self.registre.album(cle)
+            d = self.registre.dossier / cle
+            vues = sorted(d.glob("*.jpg"), reverse=True) if d.is_dir() else []
+            a_charger = []
+            rang = 0
+            for titre, liste, est_album, vide in (
+                    (f"ALBUM  ({len(album)})", album, True, "Aucune photo souvenir. « Ajouter des photos… » pour en mettre."),
+                    (f"VUES APPRISES PAR LA RECONNAISSANCE  ({len(vues)})", vues, False,
+                     "Pas encore de vue : elles s'ajoutent à chaque visite confirmée.")):
+                ttk.Label(grille, text=titre, style="Titre.TLabel").grid(row=rang, column=0, columnspan=6, sticky="w",
+                                                                          pady=(10 if rang else 0, 6))
+                rang += 1
+                if not liste:
+                    ttk.Label(grille, text=vide, style="Discret.TLabel").grid(row=rang, column=0, columnspan=6, sticky="w")
+                    rang += 1
+                for k, chemin in enumerate(liste):
+                    case = tk.Frame(grille, bg=CARTE)
+                    case.grid(row=rang + k // 6, column=k % 6, padx=4, pady=4, sticky="n")
+                    img = tk.Label(case, bg=FOND, width=20, height=8, cursor="hand2")
+                    img.pack()
+                    legende = chemin.name[:10] if chemin.name[:4].isdigit() else ""
+                    if legende:
+                        legende = f"{legende[8:10]}/{legende[5:7]}/{legende[:4]}"
+                    tk.Label(case, text=legende, bg=CARTE, fg=DISCRET, font=("Segoe UI", 8)).pack()
+                    img.bind("<Double-1>", lambda _e, c=chemin: os.startfile(c))
+                    img.bind("<Button-3>", lambda e, c=chemin, a=est_album: menu_photo(e, c, a))
+                    for w in (case, img):
+                        w.bind("<MouseWheel>", lambda e: defile.yview_scroll(-e.delta // 120, "units"))
+                    a_charger.append((img, chemin))
+                rang += (len(liste) + 5) // 6
+
+            def paquet(debut=0):
+                if tour != etat_photos["tour"] or not f.winfo_exists():
+                    return
+                for img, chemin in a_charger[debut:debut + 6]:
+                    vignette = self._vignette(chemin, (140, 105))
+                    if vignette and img.winfo_exists():
+                        img.configure(image=vignette, width=140, height=105)
+                        img.image = vignette
+                if debut + 6 < len(a_charger):
+                    f.after(1, paquet, debut + 6)
+            paquet()
+
+        def ajouter_photos():
+            chemins = filedialog.askopenfilenames(parent=f, title=f"Photos de {self.registre.fiches[cle]['nom']}",
+                                                  filetypes=[("Photos", "*.jpg *.jpeg *.png")])
+            if not chemins:
+                return
+            f.configure(cursor="watch")
+            f.update_idletasks()
+            try:
+                ecrits = self.registre.ajouter_album(cle, chemins)
+            finally:
+                f.configure(cursor="")
+            if v_reco.get():
+                if self.modeles_prets:
+                    self._importer_photos(cle, chemins)
+                else:
+                    messagebox.showinfo("Photos", "Les modèles se chargent encore : les photos sont dans l'album, "
+                                                  "réessayez la reconnaissance dans un moment.", parent=f)
+            if len(ecrits) < len(chemins):
+                messagebox.showwarning("Photos", f"{len(chemins) - len(ecrits)} fichier(s) illisible(s) ignoré(s).", parent=f)
+            bandeau()
+            photos()
+            self._maj_tortues()
+
+        btn_ajout.configure(command=ajouter_photos)
+
+        # --- Carnet : soins, vétérinaire, ponte…
+        cadre_carnet = ttk.Frame(onglets, style="Carte.TFrame", padding=12)
+        onglets.add(cadre_carnet, text="Carnet")
+        saisie = tk.Frame(cadre_carnet, bg=CARTE)
+        saisie.pack(fill="x")
+        v_date = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
+        v_type, v_texte = tk.StringVar(value=fiches.TYPES_CARNET[0]), tk.StringVar()
+        for col, texte in enumerate(("Date", "Type", "Ce qui s'est passé")):
+            ttk.Label(saisie, text=texte, style="Carte.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 10))
+        e_date = ttk.Entry(saisie, textvariable=v_date, width=12)
+        e_date.grid(row=1, column=0, padx=(0, 10))
+        ttk.Combobox(saisie, textvariable=v_type, values=fiches.TYPES_CARNET, width=16).grid(row=1, column=1, padx=(0, 10))
+        e_texte = ttk.Entry(saisie, textvariable=v_texte, width=60)
+        e_texte.grid(row=1, column=2, padx=(0, 10))
+        colonnes = (("date", "DATE", 100), ("type", "TYPE", 130), ("texte", "NOTE", 640))
+        liste = ttk.Treeview(cadre_carnet, columns=[c[0] for c in colonnes], show="headings", selectmode="browse")
+        liste.configure(style="Liste.Treeview")
+        for col, titre, larg in colonnes:
+            liste.heading(col, text=titre, anchor="w")
+            liste.column(col, width=larg, anchor="w", stretch=col == "texte")
+        liste.pack(fill="both", expand=True, pady=(12, 0))
+        ttk.Label(cadre_carnet, text="Vermifuge, visite chez le vétérinaire, hibernation, ponte, blessure… "
+                                     "Clic droit sur une ligne pour la retirer.", style="Discret.TLabel").pack(anchor="w", pady=(6, 0))
+
+        def carnet():
+            liste.delete(*liste.get_children())
+            for rang, n in reversed(list(enumerate(self.registre.carnet(cle)))):
+                liste.insert("", "end", iid=str(rang), values=(f"{n['date'][8:]}/{n['date'][5:7]}/{n['date'][:4]}",
+                                                               n.get("type", ""), n["texte"]))
+
+        def noter(_=None):
+            try:
+                jour = datetime.strptime(v_date.get().strip(), "%d/%m/%Y").date()
+                if jour > datetime.now().date():
+                    raise ValueError("date dans le futur")
+                self.registre.ajouter_note(cle, jour.isoformat(), v_type.get().strip() or "Note", v_texte.get())
+            except ValueError as e:
+                messagebox.showerror("Carnet", f"Note refusée : {e}\nDate au format 08/11/2026.", parent=f)
+                return
+            v_texte.set("")
+            carnet()
+
+        def menu_note(ev):
+            rang = liste.identify_row(ev.y)
+            if not rang:
+                return
+            liste.selection_set(rang)
+            m = tk.Menu(f, tearoff=0)
+            m.add_command(label="Retirer cette note", command=lambda: (self.registre.retirer_note(cle, int(rang)), carnet()))
+            m.tk_popup(ev.x_root, ev.y_root)
+
+        ttk.Button(saisie, text="Noter", style="Vert.TButton", command=noter).grid(row=1, column=3)
+        for w in (e_date, e_texte):
+            w.bind("<Return>", noter)
+        liste.bind("<Button-3>", menu_note)
+
+        # --- fermeture : ne pas perdre une identité modifiée
+        def fermer():
+            if modifiee():
+                choix = messagebox.askyesnocancel("Fiche", "Enregistrer les modifications de l'identité ?", parent=f)
+                if choix is None or (choix and not enregistrer()):
+                    return
+            self.fenetres_fiche.pop(cle, None)
+            f.destroy()
+
+        f.protocol("WM_DELETE_WINDOW", fermer)
+        f.bind("<Escape>", lambda _e: fermer())
+        onglets.bind("<<NotebookTabChanged>>",
+                     lambda _e: photos() if onglets.index("current") == 2 else None)
+        remplir()
+        aide_dates()
+        bandeau()
+        carnet()
+        onglets.select(onglet)
+
     def pesees(self, cle):
         """Pesées d'une tortue : saisie (date, poids en grammes, remarque), liste et courbe."""
         fiche = self.registre.copie_fiches().get(cle)
@@ -1140,6 +2037,10 @@ class App:
         f = tk.Toplevel(self.root, bg=CARTE, padx=16, pady=14)
         f.title(f"Poids de {fiche['nom']}")
         f.transient(self.root)
+        self._panneau_pesees(f, cle)
+
+    def _panneau_pesees(self, f, cle, taille=(820, 300), apres=None):
+        """Saisie, courbe et liste des pesées dans le cadre f. apres() : appelé à chaque changement."""
         saisie = tk.Frame(f, bg=CARTE)
         saisie.pack(fill="x")
         v_date = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
@@ -1155,7 +2056,8 @@ class App:
         resume = ttk.Label(f, style="Carte.TLabel")
         resume.pack(anchor="w")
         colonnes = (("date", "DATE", 110), ("poids", "POIDS", 100), ("ecart", "ÉCART", 160), ("note", "REMARQUE", 340))
-        liste = ttk.Treeview(f, columns=[c[0] for c in colonnes], show="headings", height=7, selectmode="browse")
+        liste = ttk.Treeview(f, columns=[c[0] for c in colonnes], show="headings", height=7, selectmode="browse",
+                             style="Liste.Treeview")
         for col, titre, larg in colonnes:
             liste.heading(col, text=titre, anchor="w")
             liste.column(col, width=larg, anchor="w")
@@ -1165,7 +2067,7 @@ class App:
 
         def rafraichir():
             pesees = self.registre.pesees(cle)
-            img = rapports.graphique_poids(pesees, "Courbe de poids", (820, 300), fond=(27, 33, 25), encre=(233, 238, 227),
+            img = rapports.graphique_poids(pesees, "Courbe de poids", taille, fond=(27, 33, 25), encre=(233, 238, 227),
                                            discret=(151, 163, 141), filet=(45, 55, 41), trait=(127, 185, 80))
             graphe.image = ImageTk.PhotoImage(img)
             graphe.configure(image=graphe.image)
@@ -1188,6 +2090,8 @@ class App:
                                  foreground=ROUGE if b["alerte"] else TEXTE)
             else:
                 resume.configure(text="Aucune pesée pour l'instant.", foreground=DISCRET)
+            if apres:
+                apres()
 
         def ajouter(_=None):
             try:
@@ -1198,7 +2102,7 @@ class App:
                 self.registre.ajouter_pesee(cle, jour.isoformat(), grammes, v_note.get())
             except ValueError as e:
                 messagebox.showerror("Pesée", f"Pesée refusée : {e}\nDate au format 05/11/2026, poids en grammes (ex. 1250).",
-                                     parent=f)
+                                     parent=f.winfo_toplevel())
                 return
             v_poids.set("")
             v_note.set("")
@@ -1214,7 +2118,9 @@ class App:
             m.tk_popup(ev.x_root, ev.y_root)
 
         ttk.Button(saisie, text="Ajouter", style="Vert.TButton", command=ajouter).grid(row=1, column=3, sticky="w")
-        f.bind("<Return>", ajouter)
+        for enfant in saisie.winfo_children():
+            if isinstance(enfant, ttk.Entry):
+                enfant.bind("<Return>", ajouter)
         liste.bind("<Button-3>", menu_pesee)
         rafraichir()
 

@@ -3,7 +3,7 @@ Broutille — sauvegarde quotidienne.
 
 Une archive « Broutille_AAAA-MM-JJ.zip » par jour dans le dossier choisi (clé USB, OneDrive,
 autre disque) : le journal des visites, les fiches des tortues (pesées comprises), leurs
-galeries de photos et les « Pas une tortue ». Les clips vidéo ne sont pas sauvegardés : trop
+galeries de photos, les « Pas une tortue » et les positions des visites. Les clips vidéo ne sont pas sauvegardés : trop
 lourds, et le ménage les efface de toute façon. Les GARDER dernières archives sont gardées.
 """
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 GARDER = 7
 FICHIERS = ("visites.csv", "visites_en_attente.jsonl", "registre.json", "registre.bak")
-DOSSIERS = ("individus", "pas_une_tortue")
+DOSSIERS = ("individus", "pas_une_tortue", "positions")
 PREFIXE = "Broutille_"
 
 

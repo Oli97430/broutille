@@ -35,6 +35,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageOps
 
 import vision
 from sources import est_fichier, masquer, ouvrir_source, source_depuis_texte
@@ -45,6 +46,8 @@ INCONNUE = "Inconnue"
 PAS_UNE_TORTUE = "Pas une tortue"
 MAX_EXEMPLES = 60               # photos gardées par individu
 EXEMPLE_DIFFERENT = 0.92        # une nouvelle vue n'entre en galerie que si elle apporte du neuf
+ALBUM = "album"                 # individus/<id>/album : photos souvenirs, jamais lues par la reconnaissance
+CHAMPS_IDENTITE = ("sexe", "naissance", "arrivee", "origine", "signes", "notes", "profil")
 
 
 def sans_accents(texte):
@@ -65,6 +68,17 @@ def ajuster(image, taille):
 
 def nom_fichier(texte):
     return "".join(c if c.isalnum() else "_" for c in sans_accents(texte)).strip("_")
+
+
+def _date_photo(img, chemin):
+    """Date de prise de vue (EXIF DateTimeOriginal), sinon date du fichier."""
+    try:
+        brut = img.getexif().get_ifd(0x8769).get(0x9003) or img.getexif().get(0x0132)
+        if brut:
+            return datetime.strptime(str(brut).strip("\x00 ")[:19], "%Y:%m:%d %H:%M:%S")
+    except (ValueError, KeyError, AttributeError, OSError):
+        pass
+    return datetime.fromtimestamp(Path(chemin).stat().st_mtime)
 
 
 def lire_image(chemin):
@@ -204,6 +218,48 @@ def secondes(ligne):
         return float(ligne.get("duree_s") or 0)
     except ValueError:
         return 0.0
+
+
+POSITIONS = "positions"
+ENTETE_POSITIONS = "id_visite;t_s;x;y;l;h;image_l;image_h\n"
+
+
+def ecrire_positions(dossier, id_visite, piste):
+    """Ajoute le trajet d'une visite à positions/AAAA-MM.csv : une ligne par analyse, le temps en
+    secondes depuis l'arrivée, le cadre en pixels. Relié au journal par id_visite : une visite
+    corrigée change de tortue sans rien réécrire ici."""
+    if not piste.trajet or not piste.taille_image:
+        return
+    d = Path(dossier) / POSITIONS
+    d.mkdir(exist_ok=True)
+    chemin = d / f"{piste.arrivee:%Y-%m}.csv"
+    nouveau = not chemin.exists()
+    il, ih = piste.taille_image
+    with open(chemin, "a", encoding="utf-8", newline="") as f:
+        if nouveau:
+            f.write(ENTETE_POSITIONS)
+        for instant, x, y, l, h in piste.trajet:
+            f.write(f"{id_visite};{instant - piste.debut:.1f};{x};{y};{l};{h};{il};{ih}\n")
+
+
+def lire_positions(dossier):
+    """{id_visite: [(t_s, x, y, l, h, image_l, image_h)]}, tous mois confondus."""
+    res = defaultdict(list)
+    d = Path(dossier) / POSITIONS
+    for chemin in sorted(d.glob("*.csv")) if d.exists() else []:
+        try:
+            lignes = chemin.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for ligne in lignes:
+            champs = ligne.split(";")
+            try:
+                point = (float(champs[1]), *(int(v) for v in champs[2:8]))
+            except (IndexError, ValueError):
+                continue                    # ligne abîmée (coupure de courant) : on l'ignore
+            if len(point) == 7:
+                res[champs[0]].append(point)
+    return dict(res)
 
 
 def nettoyer(dossier, jours=60, max_go=20.0, garder=()):
@@ -393,6 +449,18 @@ class Registre:
                 self._lire_galerie(cle)
             return contenus
 
+    def retirer_vue(self, cle, nom):
+        """Retire une vue de la galerie (mauvaise image apprise) ; la reconnaissance l'oublie aussitôt."""
+        with self._verrou:
+            chemin = self.dossier / cle / Path(nom).name
+            chemin.unlink(missing_ok=True)
+            self.points.pop(str(chemin), None)
+            if self.fiches.get(cle, {}).get("profil") == chemin.name:
+                self.fiches[cle].pop("profil")
+                self._ecrire()
+            if cle in self.fiches:
+                self._lire_galerie(cle)
+
     def deposer_exemples(self, cle, contenus):
         with self._verrou:
             d = self.dossier / cle
@@ -427,11 +495,25 @@ class Registre:
             dc.mkdir(parents=True, exist_ok=True)
             for p in ds.glob("*.jpg"):
                 p.replace(dc / p.name)
+            if (ds / ALBUM).is_dir():           # l'album suit : rmtree l'effacerait
+                (dc / ALBUM).mkdir(exist_ok=True)
+                for p in (ds / ALBUM).iterdir():
+                    if p.is_file():
+                        dest, n = dc / ALBUM / p.name, 1
+                        while dest.exists():        # même nom : renommer, jamais perdre une photo
+                            n += 1
+                            dest = dc / ALBUM / f"{p.stem}_f{n}{p.suffix}"
+                        p.replace(dest)
             shutil.rmtree(ds, ignore_errors=True)
-            self.fiches[cible]["provisoire"] = False if not self.fiches[source]["provisoire"] else self.fiches[cible]["provisoire"]
-            pesees = self.fiches[cible].get("pesees", []) + self.fiches[source].get("pesees", [])
-            if pesees:
-                self.fiches[cible]["pesees"] = sorted(pesees, key=lambda p: p["date"])
+            fs, fc = self.fiches[source], self.fiches[cible]
+            fc["provisoire"] = False if not fs["provisoire"] else fc["provisoire"]
+            for liste in ("pesees", "carnet"):
+                tout = fc.get(liste, []) + fs.get(liste, [])
+                if tout:
+                    fc[liste] = sorted(tout, key=lambda p: p["date"])
+            for champ in CHAMPS_IDENTITE:       # la fiche gardée complète ce qui lui manque
+                if fs.get(champ) and not fc.get(champ):
+                    fc[champ] = fs[champ]
             del self.fiches[source]
             self.alias[source] = cible
             self.vecteurs.pop(source, None)
@@ -460,6 +542,78 @@ class Registre:
     def pesees(self, cle):
         with self._verrou:
             return [dict(p) for p in self.fiches.get(cle, {}).get("pesees", [])]
+
+    # --- carnet : [{"date", "type", "texte"}] par ordre de date (soins, vétérinaire, ponte…)
+    def ajouter_note(self, cle, jour, genre, texte):
+        texte = texte.strip()
+        if not texte:
+            raise ValueError("note vide")
+        jour = date.fromisoformat(str(jour)).isoformat()
+        with self._verrou:
+            carnet = self.fiches[cle].get("carnet", []) + [{"date": jour, "type": genre, "texte": texte}]
+            self.fiches[cle]["carnet"] = sorted(carnet, key=lambda n: n["date"])
+            self._ecrire()
+
+    def retirer_note(self, cle, rang):
+        with self._verrou:
+            carnet = list(self.fiches[cle].get("carnet", []))
+            if 0 <= rang < len(carnet):
+                del carnet[rang]
+                self.fiches[cle]["carnet"] = carnet
+                self._ecrire()
+
+    def carnet(self, cle):
+        with self._verrou:
+            return [dict(n) for n in self.fiches.get(cle, {}).get("carnet", [])]
+
+    # --- album : photos souvenirs (individus/<id>/album/), hors reconnaissance
+    def album(self, cle):
+        d = self.dossier / cle / ALBUM
+        return sorted((p for p in d.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png")),
+                      reverse=True) if d.is_dir() else []
+
+    def ajouter_album(self, cle, chemins):
+        """Copie les photos dans l'album, réduites à 2000 px ; renvoie les noms écrits.
+        Le nom commence par la date de prise de vue (EXIF) ou du fichier : l'album se trie seul."""
+        d = self.dossier / cle / ALBUM
+        d.mkdir(parents=True, exist_ok=True)
+        ecrits = []
+        for chemin in chemins:
+            chemin = Path(chemin)
+            try:
+                with Image.open(chemin) as img:
+                    quand = _date_photo(img, chemin)
+                    img = ImageOps.exif_transpose(img).convert("RGB")
+                    img.thumbnail((2000, 2000))
+                    base = f"{quand:%Y-%m-%d_%H-%M-%S}_{nom_fichier(chemin.stem)[:30]}"
+                    cible, n = d / f"{base}.jpg", 1
+                    while cible.exists():
+                        n += 1
+                        cible = d / f"{base}_{n}.jpg"
+                    img.save(cible, quality=90)
+                    ecrits.append(cible.name)
+            except (OSError, ValueError):
+                continue
+        return ecrits
+
+    def retirer_album(self, cle, nom):
+        with self._verrou:
+            (self.dossier / cle / ALBUM / nom).unlink(missing_ok=True)
+            if self.fiches.get(cle, {}).get("profil") == f"{ALBUM}/{nom}":
+                self.fiches[cle].pop("profil")
+                self._ecrire()
+
+    def photo_profil(self, cle):
+        """Photo choisie, sinon la plus récente de l'album, sinon la première vue de la galerie."""
+        d = self.dossier / cle
+        choisie = self.fiches.get(cle, {}).get("profil")
+        if choisie and (d / choisie).is_file():
+            return d / choisie
+        album = self.album(cle)
+        if album:
+            return album[0]
+        vues = sorted(d.glob("*.jpg")) if d.is_dir() else []
+        return vues[0] if vues else None
 
     def supprimer(self, cle):
         with self._verrou:
@@ -550,6 +704,9 @@ class Piste:
         self.etiquette = ""
         self.rejets = 0
         self.clip = None            # nom du clip qui la montre ; "" si aucun n'a pu s'ouvrir
+        self.nommee = None          # fiche choisie par l'utilisateur sur la vidéo, ou PAS_UNE_TORTUE
+        self.trajet = []            # [(instant, x, y, l, h)] à chaque analyse, en pixels
+        self.taille_image = None    # (largeur, hauteur) de l'image analysée
 
     def ajouter_exemple(self, q, tortue, vecteurs, image, cle=None, score=0.0, isolee=True):
         """Garde les vues les plus nettes : (netteté, tortue isolée, vecteurs, image entière,
@@ -562,7 +719,10 @@ class Piste:
         return max(self.especes, key=self.especes.get) if self.especes else INCONNUE
 
     def confirmee(self):
-        """Assez vue pour y croire : une pierre ou un « Pas une tortue » n'ouvre aucun clip."""
+        """Assez vue pour y croire : une pierre ou un « Pas une tortue » n'ouvre aucun clip.
+        Nommée par l'utilisateur, elle est confirmée d'office (ou écartée si « Pas une tortue »)."""
+        if self.nommee is not None:
+            return self.nommee != PAS_UNE_TORTUE
         return self.analyses >= 2 and float(np.mean(self.p_tortue)) >= 0.5 and self.rejets <= self.analyses / 2
 
     def verdict(self):
@@ -812,6 +972,8 @@ class Surveillance:
         for piste, i in paires:
             _score, boite, p_tortue, classes = fiches[i]
             piste.boite, piste.vue = boite, instant
+            piste.trajet.append((instant, *(int(v) for v in boite)))
+            piste.taille_image = (image.shape[1], image.shape[0])
             piste.analyses += 1
             piste.p_tortue.append(p_tortue)
             for nom, p in classes[:3]:
@@ -846,6 +1008,21 @@ class Surveillance:
         self._galerie_matrice = np.stack(list(actuel.values())) if len(actuel) >= GALERIE_MIN else None
         return self._galerie_matrice
 
+    def nommer_piste(self, numero, cle):
+        """L'utilisateur nomme sur la vidéo la tortue suivie `numero` : `cle` d'une fiche, ou
+        PAS_UNE_TORTUE. La visite sera notée à ce nom (corrigée à la main) et ses vues isolées
+        rejoindront la galerie. Renvoie False si la tortue est déjà partie."""
+        if cle != PAS_UNE_TORTUE and cle not in self.registre.fiches:
+            raise KeyError(cle)
+        with self._verrou:
+            piste = next((p for p in self.pistes if p.numero == numero), None)
+            if piste is None:
+                return False
+            piste.nommee = cle
+            piste.etiquette = PAS_UNE_TORTUE if cle == PAS_UNE_TORTUE else self.registre.fiches[cle]["nom"]
+        self.sur_message(f"Tortue nommée sur la vidéo : {piste.etiquette}")
+        return True
+
     def _seuil_image(self):
         unique = sum(g is not None for g in self.registre.vecteurs.values()) <= 1
         return self.seuil + (SUPPLEMENT_FICHE_UNIQUE if unique else 0.0)
@@ -871,6 +1048,8 @@ class Surveillance:
             piste.proposition[cle] += score
         if score >= self._seuil_image() and score - deuxieme >= self.marge:
             piste.individus[cle].append((instant, score))
+        if piste.nommee is not None:            # nommée sur la vidéo : son nom ne change plus
+            return
         fiches = self.registre.fiches
         sure = piste.verdict()[0]
         if sure in fiches:
@@ -879,12 +1058,16 @@ class Surveillance:
             piste.etiquette = f"{fiches[piste.probable()]['nom']} ?"
 
     # --- fin de présence
-    def _enrichir_galerie(self, piste, cle, nouvelle, base_visite):
+    def _enrichir_galerie(self, piste, cle, nouvelle, base_visite, manuelle=False):
         """Reconnue une fois, une tortue gagne ses autres vues de la visite. Seulement celles où elle
         est aussi arrivée en tête, sans voisine tout près : une vue d'une autre tortue, entrée par un
         échange de pistes, ferait reconnaître cette autre tortue à sa place."""
         r = self.registre
         for i, (_q, tortue, vecteurs, _image, tete, score, isolee) in enumerate(piste.exemples):
+            if manuelle:                    # l'utilisateur l'a nommée : ses vues seules sont sûres
+                if isolee:
+                    r.ajouter_exemple(cle, tortue, f"{base_visite}_{i}.jpg")
+                continue
             if vecteurs is None or not (nouvelle or (tete == cle and score >= SEUIL_PROPOSITION and isolee)):
                 continue
             g = r.vecteurs.get(cle)
@@ -894,22 +1077,29 @@ class Surveillance:
     def _terminer_piste(self, piste):
         """Écrit la ligne du journal d'une tortue partie ; renvoie la ligne, ou None si fausse alerte."""
         duree = max(0.0, piste.vue - piste.debut)
-        if duree < self.presence_min or not piste.confirmee():      # bout de tortue qui sort du champ, pierre
+        r = self.registre
+        if piste.nommee == PAS_UNE_TORTUE:          # désignée sur la vidéo : ignorée la prochaine fois
+            base = f"{piste.arrivee:%Y-%m-%d_%H-%M-%S}_{piste.numero}"
+            r.rejeter([(f"{base}_{i}.jpg", cv2.imencode(".jpg", e[1])[1].tobytes())
+                       for i, e in enumerate(piste.exemples) if e[6]])
+        if (duree < self.presence_min and piste.nommee is None) or not piste.confirmee():   # bout de tortue, pierre
             self._nettoyer_clip(piste.clip)
             return None
         espece = piste.espece()
-        r = self.registre
         cle, score = piste.verdict()
         cle = r.resoudre(cle) if cle else None
         source = "image"
         nouvelle = False
+        manuelle = piste.nommee is not None and r.resoudre(piste.nommee) is not None
+        if manuelle:
+            cle, score, source = r.resoudre(piste.nommee), 1.0, "manuel"
         if cle is None and self.reconnaissance_active and self.creer_nouvelles and len(piste.exemples) >= 2:
             cle = r.creer(r.nom_provisoire(espece), espece, provisoire=True)
             score, source, nouvelle = 0.0, "nouvelle", True
             self.sur_message(f"Nouvelle tortue : {r.fiches[cle]['nom']}")
         base_visite = f"{piste.arrivee:%Y-%m-%d_%H-%M-%S}_{piste.numero}"
         if cle:
-            self._enrichir_galerie(piste, cle, nouvelle, base_visite)
+            self._enrichir_galerie(piste, cle, nouvelle, base_visite, manuelle)
         photo = ""
         if piste.exemples:
             photo = f"{base_visite}_photo.jpg"
@@ -919,13 +1109,18 @@ class Surveillance:
         ligne = {"id_visite": base_visite, "date": f"{piste.arrivee:%Y-%m-%d}", "heure": f"{piste.arrivee:%H:%M:%S}",
                  "duree_s": f"{duree:.0f}", "individu": fiche["nom"] if fiche else INCONNUE,
                  "espece": fiche["espece"] if fiche else espece, "confiance": f"{min(score, 1):.2f}",
-                 "video": piste.clip or "", "photo": photo, "source": source, "corrige": "", "id_individu": cle or "",
+                 "video": piste.clip or "", "photo": photo, "source": source, "corrige": "1" if manuelle else "",
+                 "id_individu": cle or "",
                  "proposition": "", "id_proposition": ""}
         probable = r.resoudre(piste.probable()) if piste.probable() else None
         if cle is None and probable:
             ligne.update(proposition=r.fiches[probable]["nom"], id_proposition=probable)
         if not ajouter_ligne(self.dossier, ligne):
             self.sur_message("visites.csv est ouvert ailleurs : la visite attend d'y être écrite")
+        try:
+            ecrire_positions(self.dossier, base_visite, piste)
+        except OSError as e:            # positions perdues : la visite, elle, est notée
+            self.sur_message(f"Positions non écrites : {e}")
         self.sur_message(f"Fin de visite : {ligne['individu']} ({ligne['espece']}), {duree:.0f} s")
         self.sur_visite(ligne)
         self._nettoyer_clip(piste.clip)
@@ -1106,6 +1301,11 @@ class Surveillance:
                                        "enregistrement": self.video is not None, "fps": fps_mesure,
                                        "duree": instant - self.debut_clip if self.video is not None else 0,
                                        "presence": len(confirmees),
+                                       # toutes les pistes, douteuses comprises : un clic sur la vidéo les nomme
+                                       # 5e valeur : fiche de la tortue (choisie ou probable), pour ouvrir sa fiche d'un clic
+                                       "pistes": [(p.numero, p.boite, p.etiquette or "…", p.confirmee(),
+                                                   p.nommee or p.probable())
+                                                  for p in presentes if p.nommee != PAS_UNE_TORTUE],
                                        "figee_s": time.time() - t_change if figee else 0})
         finally:
             if fil is not None:

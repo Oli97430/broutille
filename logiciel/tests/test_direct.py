@@ -369,6 +369,64 @@ def essai_menage(racine):
     return n == 1 and not (d / "2020-01-01_10-00-00_1_photo.jpg").exists() and (d / "2099-01-01_10-00-00.mp4").exists(), f"{n}"
 
 
+def _piste_visible(etats):
+    """Numéro de la première piste montrée sur la vidéo (clé « pistes » de l'état)."""
+    return next((p[0] for e in reversed(etats) for p in e.get("pistes", [])), None)
+
+
+def essai_nommer_sur_video(racine):
+    """Clic sur la tortue de la vidéo, « Zoé » : la visite est notée Zoé, corrigée à la main,
+    et ses vues rejoignent la galerie de Zoé."""
+    cam = Camera()
+    etats = []
+    s, r, d, msgs = monter(cam, racine / "n1", sur_image=lambda _i, e: etats.append(e))
+    zoe = r.creer("Zoé", "Tortue radiée")
+    t, res = lancer(s)
+    attendre(lambda: cam.lues > 15)
+    d.boites = [BOITE]
+    attendre(lambda: _piste_visible(etats) is not None)
+    nommee = s.nommer_piste(_piste_visible(etats), zoe)
+    etiquette = next((p[2] for p in etats[-1].get("pistes", [])), "")
+    time.sleep(1.0)
+    etiquette = next((p[2] for p in etats[-1].get("pistes", [])), etiquette)
+    d.boites = []
+    attendre(lambda: m.lire_journal(s.dossier))
+    s.arreter()
+    t.join(15)
+    lignes = m.lire_journal(s.dossier)
+    galerie = len(list((r.dossier / zoe).glob("*.jpg")))
+    positions = m.lire_positions(s.dossier).get(lignes[0]["id_visite"], []) if lignes else []
+    ok = nommee and etiquette == "Zoé" and len(lignes) == 1 and lignes[0]["individu"] == "Zoé" \
+        and lignes[0]["corrige"] == "1" and lignes[0]["id_individu"] == zoe and galerie >= 1 and len(positions) >= 2
+    return ok, (f"nommée {nommee}, étiquette {etiquette!r}, lignes {[(l['individu'], l['corrige']) for l in lignes]}, "
+                f"galerie {galerie}, positions {len(positions)}")
+
+
+def essai_pas_une_tortue_sur_video(racine):
+    """Clic sur un objet de la vidéo, « Pas une tortue » : aucune visite, son cadre disparaît
+    et ses vues vont aux rejets. Une tortue partie ne peut plus être nommée."""
+    cam = Camera()
+    etats = []
+    s, r, d, msgs = monter(cam, racine / "n2", sur_image=lambda _i, e: etats.append(e))
+    t, res = lancer(s)
+    attendre(lambda: cam.lues > 15)
+    d.boites = [BOITE]
+    attendre(lambda: _piste_visible(etats) is not None)
+    numero = _piste_visible(etats)
+    s.nommer_piste(numero, m.PAS_UNE_TORTUE)
+    time.sleep(0.5)
+    cache = not any(p[0] == numero for p in etats[-1].get("pistes", []))
+    d.boites = []
+    attendre(lambda: not s.pistes, 5)
+    time.sleep(0.5)
+    partie = s.nommer_piste(numero, m.PAS_UNE_TORTUE)
+    s.arreter()
+    t.join(15)
+    lignes = m.lire_journal(s.dossier)
+    rejets = r.nombre_rejets()
+    return cache and not lignes and rejets >= 1 and partie is False,         f"cadre caché {cache}, lignes {len(lignes)}, rejets {rejets}, piste partie {partie}"
+
+
 def essai_masque():
     return sources.masquer("rtsp://admin:secret@192.168.1.5:554/H.264") == "rtsp://admin:•••@192.168.1.5:554/H.264", ""
 
@@ -380,7 +438,8 @@ def main():
     essais = [essai_correction_concurrente, essai_journal_bloque, essai_objet_fixe, essai_fps_faux,
               essai_fin_de_visite_sans_trou, essai_photo_retiree, essai_reconnexion, essai_source_figee,
               essai_source_absente, essai_journal_abime, essai_galerie_abimee, essai_prefixe_visite,
-              essai_galerie_pleine, essai_fusion_en_cours, essai_menage]
+              essai_galerie_pleine, essai_fusion_en_cours, essai_menage, essai_nommer_sur_video,
+              essai_pas_une_tortue_sur_video]
     for essai in essais:
         m.ouvrir_source = ouvrir
         reussi, detail = essai(racine)
