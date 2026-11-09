@@ -22,17 +22,18 @@ MOIS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août
 def lire_date_partielle(texte, aujourd_hui=None):
     """« 2019 », « 03/2019 », « 15/03/2019 » ou ISO → "AAAA", "AAAA-MM" ou "AAAA-MM-JJ".
     Chaîne vide → "". ValueError si la date est impossible ou dans le futur."""
-    t = (texte or "").strip().replace(".", "/").replace("-", "/").replace(" ", "")
-    if not t:
+    t = (texte or "").strip().replace(".", "/").replace("-", "/").replace(" ", "/")
+    morceaux = [m for m in t.split("/") if m]           # « 15 03 2019 » comme « 15/03/2019 »
+    if not morceaux:
         return ""
-    morceaux = t.split("/")
     if len(morceaux[0]) == 4:            # ISO : AAAA/MM/JJ
         morceaux = morceaux[::-1]
     if not all(m.isdigit() for m in morceaux) or len(morceaux) > 3:
         raise ValueError(f"date illisible : « {texte} »")
     annee = int(morceaux[-1])
-    if annee < 100:                      # « 03/19 »
-        annee += 2000
+    aujourd_hui = aujourd_hui or date.today()
+    if annee < 100:                      # « 03/19 » → 2019, « 03/99 » → 1999
+        annee += 2000 if annee + 2000 <= aujourd_hui.year else 1900
     mois = int(morceaux[-2]) if len(morceaux) >= 2 else None
     jour = int(morceaux[-3]) if len(morceaux) == 3 else None
     aujourd_hui = aujourd_hui or date.today()
@@ -73,12 +74,14 @@ def date_saisie(valeur):
 
 
 def age_mois(naissance, aujourd_hui=None):
-    """Âge en mois entiers (date partielle : on compte depuis le milieu de la période)."""
+    """Âge en mois entiers (date partielle : on compte depuis le milieu de la période ;
+    année en cours sans mois : depuis janvier, pour ne pas tomber en dessous de zéro)."""
     if not naissance:
         return None
     aujourd_hui = aujourd_hui or date.today()
     p = [int(x) for x in naissance.split("-")]
-    annee, mois, jour = p[0], (p[1] if len(p) > 1 else 7), (p[2] if len(p) > 2 else 1)
+    mois_defaut = 7 if p[0] < aujourd_hui.year else 1
+    annee, mois, jour = p[0], (p[1] if len(p) > 1 else mois_defaut), (p[2] if len(p) > 2 else 15)
     m = (aujourd_hui.year - annee) * 12 + aujourd_hui.month - mois - (1 if aujourd_hui.day < jour else 0)
     return max(0, m)
 

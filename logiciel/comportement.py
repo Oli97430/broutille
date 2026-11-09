@@ -85,7 +85,8 @@ def regularite(liste):
 
 
 def heure_lisible(h):
-    return f"{int(h):02d} h {int(round((h % 1) * 60)) % 60:02d}"
+    m = round(h * 60)
+    return f"{m // 60 % 24:02d} h {m % 60:02d}"
 
 
 # ------------------------------------------------------------------ réseau social

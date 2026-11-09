@@ -106,7 +106,7 @@ def graphique_repas(series, titre="", taille=(1060, 420), fond=(255, 255, 255), 
     x0, y0, x1, y1 = gauche, haut + 6, l - 8, h - bas
     minutes = [s / 60 for _j, s, _n in series]
     maxi = max(minutes + [1.0])
-    pas = next(p for p in (1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 480) if maxi / p <= 5)
+    pas = next((p for p in (1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 480) if maxi / p <= 5), maxi / 5)
     plafond = pas * (int(maxi / pas) + 1)
     for k in range(0, int(plafond / pas) + 1):
         v = k * pas
@@ -206,7 +206,8 @@ def graphique_poids(pesees, titre="", taille=(1060, 420), fond=(255, 255, 255), 
     marge = max((haut_g - bas_g) * 0.15, haut_g * 0.03, 5)
     bas_g, haut_g = max(0, bas_g - marge), haut_g + marge
     etendue = haut_g - bas_g
-    pas = next(p for p in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000) if etendue / p <= 6)
+    pas = next((p for p in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000)
+                if etendue / p <= 6), etendue / 6)
     v = pas * int(bas_g / pas)
     while v <= haut_g:
         if v >= bas_g:
@@ -267,7 +268,10 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
     page1 = Image.new("RGB", PAGE, "white")
     d = ImageDraw.Draw(page1)
     y = MARGE
-    d.text((MARGE, y), fiche.get("nom", "Tortue"), font=f_titre, fill=ENCRE)
+    titre = fiche.get("nom", "Tortue")
+    while d.textlength(titre, font=f_titre) > PAGE[0] - 2 * MARGE - 360 and len(titre) > 4:
+        titre = titre[:-2].rstrip() + "…" if not titre.endswith("…") else titre[:-2] + "…"
+    d.text((MARGE, y), titre, font=f_titre, fill=ENCRE)
     y += 70
     d.text((MARGE, y), fiches.resume_identite(fiche, fin), font=f_sous, fill=GRIS)
     d.text((PAGE[0] - MARGE, MARGE + 12), f"Fiche du {fin.strftime('%d/%m/%Y')}", font=f_texte, fill=GRIS, anchor="ra")
@@ -306,7 +310,7 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
     if fiche.get("arrivee"):
         lignes.append(("Arrivée à la maison", fiches.date_lisible(fiche["arrivee"])))
     if fiche.get("signes"):
-        lignes.append(("Signes distinctifs", fiche["signes"][:60]))
+        lignes.append(("Signes distinctifs", fiche["signes"][:38] + ("…" if len(fiche["signes"]) > 38 else "")))
     bp = bilan_poids(fiche.get("pesees", []), fin)
     if bp:
         jour = bp["dernier"]["date"]

@@ -74,12 +74,14 @@ def main():
     piste = m.Piste((10, 20, 30, 40), 100.0)
     piste.trajet = [(100.0, 10, 20, 30, 40), (101.0, 15, 20, 30, 40)]
     piste.taille_image = (L, H)
+    # arrivée à 10:00:00,7 : le journal écrit 10:00:00, les temps comptent donc depuis la seconde ronde
+    piste.arrivee = piste.arrivee.replace(microsecond=700000)
     m.ecrire_positions(d, "vX", piste)
     m.ecrire_positions(d, "vY", piste)
     (d / m.POSITIONS / f"{piste.arrivee:%Y-%m}.csv").open("a", encoding="utf-8").write("vZ;abîmée\n")
     lu = m.lire_positions(d)
     res.append(("positions écrites puis relues, ligne abîmée ignorée",
-                lu.get("vX") == [(0.0, 10, 20, 30, 40, L, H), (1.0, 15, 20, 30, 40, L, H)] and set(lu) == {"vX", "vY"},
+                lu.get("vX") == [(0.7, 10, 20, 30, 40, L, H), (1.7, 15, 20, 30, 40, L, H)] and set(lu) == {"vX", "vY"},
                 str(lu.get("vX"))))
     shutil.rmtree(d, ignore_errors=True)
 

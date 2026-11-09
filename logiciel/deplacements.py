@@ -148,7 +148,7 @@ def _paire(r, a, b, communs):
             r["chevauchements"] += 1
         dessus = chevauche
         suiveuse = None
-        if k:
+        if k and (p[0] - communs[k - 1][0][0]).total_seconds() <= 30:   # pas de poursuite à travers un trou
             p0, q0 = communs[k - 1]
             va, vb = (p[1] - p0[1], p[2] - p0[2]), (q[1] - q0[1], q[2] - q0[2])
             na, nb = math.hypot(*va), math.hypot(*vb)

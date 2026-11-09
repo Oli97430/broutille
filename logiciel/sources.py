@@ -46,9 +46,18 @@ def masquer(source):
     """Adresse sans son mot de passe : elle s'affiche à l'écran et dans les messages."""
     if not est_flux(source):
         return str(source)
-    u = urllib.parse.urlsplit(source)
-    if u.password:
-        return source.replace(f":{u.password}@", ":•••@")
+    try:
+        u = urllib.parse.urlsplit(source)
+        mot = u.password
+    except ValueError:                  # adresse malformée : on ne montre rien de risqué
+        return source.split("?", 1)[0].split("@")[-1]
+    if mot:
+        source = source.replace(f":{mot}@", ":•••@")
+    if u.query:                         # caméras IP : ?user=admin&pwd=…
+        morceaux = []
+        for k, v in urllib.parse.parse_qsl(u.query, keep_blank_values=True):
+            morceaux.append(f"{k}={'•••' if k.lower() in ('pwd', 'pass', 'passwd', 'password', 'mdp', 'token', 'key') else v}")
+        source = source.split("?", 1)[0] + "?" + "&".join(morceaux)
     return source
 
 

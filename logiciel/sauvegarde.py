@@ -11,6 +11,8 @@ import zipfile
 from datetime import date
 from pathlib import Path
 
+from broutille_cam import VERROU_JOURNAL
+
 GARDER = 7
 FICHIERS = ("visites.csv", "visites_en_attente.jsonl", "registre.json", "registre.bak")
 DOSSIERS = ("individus", "pas_une_tortue", "positions")
@@ -36,14 +38,32 @@ def sauvegarder(dossier, destination, jour=None, garder=GARDER):
     final = destination / nom_archive(jour)
     if final.exists():
         return None
+    for vieux in destination.glob(f"{PREFIXE}*.tmp"):   # restes d'une sauvegarde ratée (clé pleine…)
+        vieux.unlink(missing_ok=True)
     tmp = final.with_suffix(".tmp")
     n = 0
+    try:
+        n = _ecrire_archive(tmp, dossier)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(final)          # une archive à moitié écrite (clé arrachée) ne passe jamais pour bonne
+    anciennes = sorted(destination.glob(f"{PREFIXE}????-??-??.zip"))
+    for p in anciennes[:-garder] if garder else []:
+        p.unlink(missing_ok=True)
+    return final, n
+
+
+def _ecrire_archive(tmp, dossier):
+    n = 0
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-        for nom in FICHIERS:
-            p = dossier / nom
-            if p.is_file():
-                z.write(p, nom)
-                n += 1
+        # journal et visites en attente lus ensemble, sous le verrou du journal : rien ne passe entre les deux
+        with VERROU_JOURNAL:
+            for nom in FICHIERS:
+                p = dossier / nom
+                if p.is_file():
+                    z.write(p, nom)
+                    n += 1
         for nom in DOSSIERS:
             racine = dossier / nom
             if not racine.is_dir():
@@ -52,11 +72,7 @@ def sauvegarder(dossier, destination, jour=None, garder=GARDER):
                 if p.is_file() and p.suffix != ".tmp":
                     z.write(p, p.relative_to(dossier).as_posix())
                     n += 1
-    tmp.replace(final)          # une archive à moitié écrite (clé arrachée) ne passe jamais pour bonne
-    anciennes = sorted(destination.glob(f"{PREFIXE}????-??-??.zip"))
-    for p in anciennes[:-garder] if garder else []:
-        p.unlink(missing_ok=True)
-    return final, n
+    return n
 
 
 def restaurer(archive, dossier):

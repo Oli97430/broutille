@@ -23,6 +23,8 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
+import alertes
+import clips
 import comportement
 import deplacements
 import demarrage
@@ -32,7 +34,7 @@ import sauvegarde
 import sources
 import vision
 import web
-from broutille_cam import (INCONNUE, MARGE_INDIVIDU, PAS_UNE_TORTUE, SEUIL_INDIVIDU, JournalOccupe, Registre,
+from broutille_cam import (INCONNUE, VERROU_JOURNAL, MARGE_INDIVIDU, PAS_UNE_TORTUE, SEUIL_INDIVIDU, JournalOccupe, Registre,
                            ALBUM, RegistreIllisible, Surveillance, corriger_visite, inscrire_photos, lire_journal,
                            lire_positions, renommer_dans_journal, secondes)
 
@@ -61,6 +63,10 @@ DEFAUTS = {
     "web_actif": False,         # accès depuis le téléphone (Wi-Fi de la maison)
     "web_code": "",             # code à 6 chiffres demandé par le téléphone ; créé au premier usage
     "web_port": 0,              # port retenu (0 = premier libre à partir de 8642)
+    "ntfy_actif": False,        # alertes sur le téléphone par l'appli ntfy
+    "ntfy_sujet": "",           # sujet secret, tiré au hasard au premier usage
+    "ntfy_serveur": alertes.SERVEUR,
+    "clips_auto": True,         # clip vertical (Shorts / Reels) après la visite d'une tortue reconnue
 }
 
 # Thème
@@ -115,6 +121,9 @@ class App:
         self.repas_du_jour = []         # [(nom, secondes)] des repas d'aujourd'hui, les plus longs d'abord
         self.image_web = None           # dernière image pour le téléphone
         self.serveur_web = None
+        self.alertes = None
+        self.file_clips = queue.Queue()
+        self.dernier_clip = {}          # clé -> instant du dernier clip automatique
         self.photo_visite = None
         self.modeles_prets = False
         self.fermeture = False
@@ -136,6 +145,8 @@ class App:
         elif self.cfg["demarrage_auto"]:
             self.root.after(500, self.demarrer)
         self.root.after(15000, self._sauvegarde_auto)
+        self._maj_alertes()
+        threading.Thread(target=self._fil_clips, daemon=True).start()
         if self.cfg["web_actif"]:
             self.root.after(800, lambda: self._web(True, silencieux=True))
 
@@ -170,14 +181,23 @@ class App:
 
     # -------------------------------------------------------------- config
     def _lire_config(self):
-        try:
-            return json.loads(CONFIG.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        # fichier abîmé (coupure pendant l'écriture) : la copie .bak garde code du téléphone, sujet des alertes…
+        for chemin in (CONFIG, CONFIG.with_suffix(".bak")):
+            try:
+                cfg = json.loads(chemin.read_text(encoding="utf-8"))
+                if isinstance(cfg, dict):
+                    return cfg
+            except (OSError, ValueError):
+                pass
+        return {}
 
     def _ecrire_config(self):
         try:
-            CONFIG.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp = CONFIG.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            if CONFIG.exists():
+                CONFIG.replace(CONFIG.with_suffix(".bak"))
+            tmp.replace(CONFIG)
         except OSError:
             pass
 
@@ -473,19 +493,26 @@ class App:
                                 parent=f)
             lbl_point.configure(text="En attente : souris immobile 3 s sur le bouton…")
 
-            def travail():
-                trouve = sources.apprendre_point(titre)
+            resultat = []
 
-                def fini():
-                    if trouve:
-                        point[0] = trouve
-                        lbl_point.configure(text=f"bouton appris ({trouve[0]:.0%}, {trouve[1]:.0%})")
-                        v_relance.set(True)
-                    else:
-                        lbl_point.configure(text="pas de bouton appris : recommencez")
-                if f.winfo_exists():
-                    f.after(0, fini)
+            def travail():
+                resultat.append(sources.apprendre_point(titre))
+
+            def attendre():                 # interrogé depuis le fil de l'interface : Tk n'aime pas les autres fils
+                if not f.winfo_exists():
+                    return
+                if not resultat:
+                    f.after(200, attendre)
+                    return
+                trouve = resultat[0]
+                if trouve:
+                    point[0] = trouve
+                    lbl_point.configure(text=f"bouton appris ({trouve[0]:.0%}, {trouve[1]:.0%})")
+                    v_relance.set(True)
+                else:
+                    lbl_point.configure(text="pas de bouton appris : recommencez")
             threading.Thread(target=travail, daemon=True).start()
+            f.after(200, attendre)
 
         ttk.Button(f, text="📍  Montrer le bouton…", command=apprendre).grid(row=10, column=0, sticky="w")
         v_sauvegarde = tk.StringVar(value=self.cfg["sauvegarde_dossier"])
@@ -535,8 +562,13 @@ class App:
             self._sauvegarde_maintenant()
             f.destroy()
             if nouveau_dossier:
+                for cle in list(self.fenetres_fiche):
+                    self._fermer_fiche(cle)
                 self.registre = Registre(self.dossier, self.registre.descripteur)
                 threading.Thread(target=self._precharger, daemon=True).start()
+                if self.serveur_web:            # le serveur du téléphone tenait l'ancien registre
+                    self._web(True)
+                self._maj_alertes()
             if change:
                 self.lbl_etat.configure(text="Réglage enregistré : relancez Broutille pour l'appliquer")
             self.charger_historique()
@@ -591,6 +623,10 @@ class App:
         self.image_web = (image, etat)          # lue par le serveur du téléphone, sans la consommer
 
     def _boucle(self):
+        if self.fermeture and not self._tk_vivant():
+            return
+        if self.diffusion is not None and not self.diffusion.winfo_exists():
+            self._quitter_diffusion()           # fermée par Alt+F4 : retour à l'affichage normal
         try:
             self._traiter_messages()
             with self.verrou:
@@ -608,8 +644,14 @@ class App:
             journaliser_erreur(e)
             self.lbl_etat.configure(text=f"Erreur d'affichage : {type(e).__name__}")
         finally:
-            if self.root.winfo_exists():
+            if self._tk_vivant():
                 self.root.after(30, self._boucle)
+
+    def _tk_vivant(self):
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _traiter_messages(self):
         while not self.messages.empty():
@@ -631,6 +673,8 @@ class App:
                     self.root.bell()
                     serie = self.relance_serie
                     self.root.after(3000, lambda: self._relancer_direct(1, serie))
+                    # toujours figée 5 min plus tard (relance ratée) : prévenir le téléphone
+                    self.root.after(300000, lambda: self._alerte_figee(serie))
             elif genre == "sauvegarde":
                 self.lbl_etat.configure(text=contenu)
             elif genre == "visite":
@@ -638,6 +682,7 @@ class App:
                 self._afficher_visite(contenu)
                 self._maj_stats()
                 self._maj_tortues()
+                self._clip_auto(contenu)
             elif genre == "corrige":
                 self.charger_historique()
                 self.lbl_etat.configure(text=contenu)
@@ -647,6 +692,12 @@ class App:
                 if self.fermeture:
                     self.root.destroy()
                     return
+                if not contenu and self.alertes:
+                    self.alertes.en_fond(self.alertes.signaler, f"arret:{time.time():.0f}",
+                                         "Surveillance arrêtée",
+                                         # texte fixe : le message d'erreur peut contenir chemins et nom d'utilisateur
+                                         "La surveillance s'est arrêtée sur une erreur : voir le PC.", 4,
+                                         ("warning", "video_camera"))
                 if not contenu and self.diffusion is None:     # pas de boîte d'erreur en plein direct
                     messagebox.showerror("Source vidéo", self.lbl_etat.cget("text"))
                 self.surveillance, self.derniere_image, self.image_web = None, None, None
@@ -752,7 +803,7 @@ class App:
         # le Label centre l'image : décalage pour retrouver la tortue sous un clic
         ox, oy = (self.video.winfo_width() - nw) // 2, (self.video.winfo_height() - nh) // 2
         self.zones_video = []
-        pistes = etat.get("pistes") or [(None, b, t, True, None) for b, t in etat["tortues"]]
+        pistes = etat["pistes"] if "pistes" in etat else [(None, b, t, True, None) for b, t in etat["tortues"]]
         for numero, boite, texte, sure, *reste in pistes:
             cle = reste[0] if reste else None
             x, y, bw, bh = (int(v * e) for v in boite)
@@ -840,21 +891,26 @@ class App:
         f.title("Voir Broutille sur le téléphone")
         f.transient(self.root)
         f.resizable(False, False)
+        gauche = tk.Frame(f, bg=CARTE)
+        gauche.pack(side="left", anchor="n")
+        tk.Frame(f, bg=BORD, width=1).pack(side="left", fill="y", padx=22)
+        droite = tk.Frame(f, bg=CARTE)
+        droite.pack(side="left", anchor="n")
         v_actif = tk.BooleanVar(value=self.serveur_web is not None)
-        ttk.Checkbutton(f, text="Accès depuis le téléphone (Wi-Fi de la maison)", variable=v_actif,
+        ttk.Checkbutton(gauche, text="Accès depuis le téléphone (Wi-Fi de la maison)", variable=v_actif,
                         command=lambda: (self._web(v_actif.get()), montrer())).pack(anchor="w")
-        qr = tk.Label(f, bg=CARTE)
+        qr = tk.Label(gauche, bg=CARTE)
         qr.pack(pady=(14, 8))
-        lbl_url = tk.Label(f, bg=CARTE, fg=TEXTE, font=("Segoe UI Semibold", 13))
+        lbl_url = tk.Label(gauche, bg=CARTE, fg=TEXTE, font=("Segoe UI Semibold", 13))
         lbl_url.pack()
-        lbl_code = tk.Label(f, bg=CARTE, fg=AMBRE, font=("Segoe UI Semibold", 13))
+        lbl_code = tk.Label(gauche, bg=CARTE, fg=AMBRE, font=("Segoe UI Semibold", 13))
         lbl_code.pack(pady=(4, 0))
-        ttk.Label(f, style="Discret.TLabel", justify="left", wraplength=420, text=(
+        ttk.Label(gauche, style="Discret.TLabel", justify="left", wraplength=420, text=(
             "Scannez le QR code avec l'appareil photo du téléphone, branché sur le même Wi-Fi que ce PC. "
             "Ensuite, ajoutez la page à l'écran d'accueil.\n\n"
             "Au premier lancement, Windows demande d'autoriser Python : cochez « Réseaux privés ».\n"
             "La page n'est pas visible depuis Internet.")).pack(anchor="w", pady=(12, 0))
-        bas = tk.Frame(f, bg=CARTE)
+        bas = tk.Frame(gauche, bg=CARTE)
         bas.pack(fill="x", pady=(14, 0))
 
         def nouveau():
@@ -866,6 +922,79 @@ class App:
         btn_code = ttk.Button(bas, text="Nouveau code", command=nouveau)
         btn_code.pack(side="left")
         ttk.Button(bas, text="Fermer", command=f.destroy).pack(side="right")
+
+        # --- alertes : marchent aussi hors de la maison, par l'appli gratuite ntfy
+        v_ntfy = tk.BooleanVar(value=bool(self.alertes))
+        v_clips = tk.BooleanVar(value=self.cfg["clips_auto"])
+
+        def basculer_ntfy():
+            if v_ntfy.get() and not self.cfg["ntfy_sujet"]:
+                self.cfg["ntfy_sujet"] = alertes.nouveau_sujet()
+            self.cfg["ntfy_actif"] = v_ntfy.get()
+            self._ecrire_config()
+            self._maj_alertes()
+            montrer_ntfy()
+
+        ttk.Checkbutton(droite, text="Alertes sur le téléphone (appli ntfy)", variable=v_ntfy,
+                        command=basculer_ntfy).pack(anchor="w")
+        qr_ntfy = tk.Label(droite, bg=CARTE)
+        qr_ntfy.pack(pady=(14, 8))
+        lbl_sujet = tk.Label(droite, bg=CARTE, fg=AMBRE, font=("Segoe UI Semibold", 11), wraplength=380)
+        lbl_sujet.pack()
+        ttk.Label(droite, style="Discret.TLabel", justify="left", wraplength=380, text=(
+            "1. Installez l'appli gratuite « ntfy » (Play Store ou App Store).\n"
+            "2. Touchez « + », puis collez le nom du sujet ci-dessus, ou scannez le QR code.\n\n"
+            "Vous serez prévenu, même loin de la maison : tortue absente depuis "
+            f"{self.cfg['alerte_jours']} jours, perte de poids, image figée, surveillance arrêtée.\n"
+            "Les alertes passent par le service public ntfy.sh ; le nom du sujet, tiré au hasard, "
+            "est la seule clé : ne le partagez pas.")).pack(anchor="w", pady=(10, 0))
+        bas_ntfy = tk.Frame(droite, bg=CARTE)
+        bas_ntfy.pack(fill="x", pady=(12, 0))
+
+        def tester():
+            a = self.alertes
+            if not a:
+                return
+
+            def travail():
+                try:
+                    alertes.envoyer(a.serveur, a.sujet, "Broutille", "Test : les alertes arrivent bien sur ce téléphone.")
+                    self.messages.put(("message", "Alerte de test envoyée"))
+                except OSError as e:
+                    self.messages.put(("message", f"Alerte de test impossible : {e}"))
+            threading.Thread(target=travail, daemon=True).start()
+
+        btn_test = ttk.Button(bas_ntfy, text="Envoyer un test", command=tester)
+        btn_test.pack(side="left")
+        ttk.Separator(droite).pack(fill="x", pady=14)
+        ttk.Checkbutton(droite, text="🎬 Clip vertical (Shorts, Reels) après chaque visite d'une tortue reconnue",
+                        variable=v_clips, command=lambda: (self.cfg.update(clips_auto=v_clips.get()),
+                                                           self._ecrire_config())).pack(anchor="w")
+        ttk.Label(droite, style="Discret.TLabel", wraplength=380, text=(
+            "Un clip par tortue toutes les 3 h au plus, dans le dossier « partage / clips » et sur la page du "
+            "téléphone. Clic droit sur une visite pour en faire un à la demande.")).pack(anchor="w", pady=(4, 0))
+
+        def montrer_ntfy():
+            if not self.alertes:
+                qr_ntfy.configure(image="", text="Alertes désactivées", fg=DISCRET, font=("Segoe UI", 11), width=30, height=10)
+                lbl_sujet.configure(text="")
+                btn_test.configure(state="disabled")
+                return
+            btn_test.configure(state="normal")
+            adresse = alertes.adresse_abonnement(self.cfg["ntfy_serveur"], self.cfg["ntfy_sujet"])
+            try:
+                import io
+                import segno
+                tampon = io.BytesIO()
+                segno.make(adresse, error="m").save(tampon, kind="png", scale=6, border=2, dark="#10140f", light="#ffffff")
+                tampon.seek(0)
+                qr_ntfy.image = ImageTk.PhotoImage(Image.open(tampon))
+                qr_ntfy.configure(image=qr_ntfy.image, text="", width=0, height=0)
+            except ImportError:
+                qr_ntfy.configure(image="", text="", width=0, height=0)
+            lbl_sujet.configure(text=f"Sujet : {self.cfg['ntfy_sujet']}")
+
+        montrer_ntfy()
 
         def montrer():
             s = self.serveur_web
@@ -903,6 +1032,7 @@ class App:
             return
         f = tk.Toplevel(self.root, bg="black", cursor="none")
         f.title("Broutille — en direct")
+        f.protocol("WM_DELETE_WINDOW", self._quitter_diffusion)
         f.attributes("-fullscreen", True)
         f.attributes("-topmost", True)
         ecran = tk.Label(f, bg="black", bd=0)
@@ -988,7 +1118,8 @@ class App:
         d = ImageDraw.Draw(img, "RGBA")
         F = self.f_diff
         connues = self.registre.fiches
-        for numero, boite, texte, sure, *reste in etat.get("pistes") or [(None, b, t, True) for b, t in etat["tortues"]]:
+        pistes = etat["pistes"] if "pistes" in etat else [(None, b, t, True) for b, t in etat["tortues"]]
+        for numero, boite, texte, sure, *reste in pistes:
             if not sure:
                 continue                    # douteuse : rien à l'écran tant qu'elle n'est pas confirmée
             cle = reste[0] if reste else None
@@ -1113,8 +1244,9 @@ class App:
     def _ouvrir_video(self, _):
         sel = self.arbre.selection()
         if sel:
-            chemin = self.dossier / self.lignes[sel[0]]["video"]
-            if chemin.exists():
+            video = self.lignes[sel[0]].get("video")
+            chemin = self.dossier / video if video else None
+            if chemin and chemin.is_file():
                 os.startfile(chemin)
 
     def _menu_visite(self, evenement):
@@ -1137,6 +1269,9 @@ class App:
         menu.add_separator()
         menu.add_command(label="Nouvelle tortue…", command=lambda: self._corriger_nouvelle(ligne))
         menu.add_command(label=PAS_UNE_TORTUE, command=lambda: self._pas_une_tortue(ligne))
+        if ligne.get("video"):
+            menu.add_separator()
+            menu.add_command(label="🎬  Clip vertical pour Shorts / Reels / TikTok", command=lambda: self._demander_clip(ligne))
         menu.tk_popup(evenement.x_root, evenement.y_root)
 
     def _menu_video(self, evenement):
@@ -1233,7 +1368,14 @@ class App:
             c.create_text(128 + barre, y + 9, anchor="w", text=duree_lisible(s), fill=DISCRET, font=("Segoe UI", 9))
 
     # -------------------------------------------------------------- tortues
+    def _fermer_fiche(self, cle):
+        f = self.fenetres_fiche.pop(cle, None)
+        if f is not None and f.winfo_exists():
+            f.destroy()
+
     def _maj_tortues(self):
+        for cle in [c for c in self.fenetres_fiche if c not in self.registre.fiches]:
+            self._fermer_fiche(cle)             # tortue fusionnée ou supprimée : sa fiche n'a plus d'objet
         a = self.arbre_t
         a.delete(*a.get_children())
         self.vignettes_tortues.clear()
@@ -1351,17 +1493,30 @@ class App:
         fs, fc = self.registre.fiches[source], self.registre.fiches[cible]
         if messagebox.askyesno("Même tortue", f"« {fs['nom']} » et « {fc['nom']} » sont la même tortue ?\n"
                                               f"Tout est regroupé sous « {fc['nom']} »."):
-            if self._journal_libre(renommer_dans_journal, self.dossier, source, fc["nom"], fc["espece"], cible):
-                self.registre.fusionner(source, cible)
+            self._journal_puis(lambda: renommer_dans_journal(self.dossier, source, fc["nom"], fc["espece"], cible),
+                               lambda: self.registre.fusionner(source, cible))
             self.charger_historique()
 
     def _supprimer(self, cle):
         fiche = self.registre.fiches[cle]
         if messagebox.askyesno("Supprimer", f"Supprimer la fiche et la galerie de « {fiche['nom']} » ?\n"
                                             "Ses visites restent au journal, sous le nom « Inconnue »."):
-            if self._journal_libre(renommer_dans_journal, self.dossier, cle, INCONNUE, None, ""):
-                self.registre.supprimer(cle)
+            self._journal_puis(lambda: renommer_dans_journal(self.dossier, cle, INCONNUE, None, ""),
+                               lambda: self.registre.supprimer(cle))
             self.charger_historique()
+
+    def _journal_puis(self, journal, registre):
+        """Journal puis fiches, sous le verrou du journal : une visite que la surveillance termine au
+        même moment ne peut pas s'écrire entre les deux avec l'ancien identifiant."""
+        erreur = None
+        with VERROU_JOURNAL:
+            try:
+                journal()
+                registre()
+            except JournalOccupe as e:
+                erreur = e
+        if erreur:                      # boîte de dialogue hors du verrou : la surveillance continue
+            messagebox.showerror("Journal", str(erreur))
 
     def _journal_libre(self, fonction, *args):
         """Journal d'abord : s'il est bloqué, les fiches ne bougent pas et rien ne diverge."""
@@ -1746,8 +1901,98 @@ class App:
                     self.sauvegarde_en_cours = False
             threading.Thread(target=travail, daemon=True).start()
 
+    # -------------------------------------------------------------- alertes (ntfy)
+    def _maj_alertes(self):
+        if self.cfg["ntfy_actif"] and self.cfg["ntfy_sujet"]:
+            self.alertes = alertes.Alertes(self.dossier, self.cfg["ntfy_serveur"], self.cfg["ntfy_sujet"],
+                                           sur_erreur=lambda t: self.messages.put(("message", t)))
+        else:
+            self.alertes = None
+
+    def _verifier_alertes(self):
+        """Absences et pertes de poids : vérifié au démarrage, puis toutes les heures."""
+        a = self.alertes
+        if not a:
+            return
+
+        def travail():
+            try:
+                journal = lire_journal(self.dossier)
+            except (JournalOccupe, OSError):
+                return
+            envoyees = a.verifier(self.registre.copie_fiches(), journal, self.cfg["alerte_jours"])
+            if envoyees:
+                self.messages.put(("message", f"{len(envoyees)} alerte(s) envoyée(s) au téléphone"))
+        threading.Thread(target=travail, daemon=True).start()
+
+    def _alerte_figee(self, serie):
+        if self.alertes and self.figee and serie == self.relance_serie and self.surveillance:
+            self.alertes.en_fond(self.alertes.signaler, f"figee:{int(time.time() // 1800)}", "Image figée",
+                                 "Le direct ne bouge plus depuis 5 minutes et la relance n'a pas marché. "
+                                 "Relancez le lecteur vidéo sur le PC.", 4, ("warning", "video_camera"))
+
+    # -------------------------------------------------------------- clips verticaux
+    def _fil_clips(self):
+        """Fabrique les clips l'un après l'autre, en tâche de fond. Attend que le clip de la visite
+        soit fermé par le moteur (il peut encore filmer une autre tortue)."""
+        while True:
+            ligne, auto, essais = self.file_clips.get()
+            source = self.dossier / ligne["video"]
+            s = self.surveillance
+            en_cours = (s is not None and getattr(s, "video", None) is not None and getattr(s, "chemin_clip", None)
+                        and Path(s.chemin_clip).name == source.name)
+            if not source.exists() and not en_cours:          # vidéo effacée : inutile d'attendre
+                if not auto:
+                    self.messages.put(("message", "Clip impossible : la vidéo de cette visite n'existe plus"))
+                continue
+            if en_cours and essais < 90:
+                threading.Timer(20, self.file_clips.put, ((ligne, auto, essais + 1),)).start()
+                continue
+            try:
+                taille = source.stat().st_size
+                time.sleep(2)
+                if source.stat().st_size != taille and essais < 90:      # encore en écriture
+                    threading.Timer(20, self.file_clips.put, ((ligne, auto, essais + 1),)).start()
+                    continue
+                fiche = self.registre.copie_fiches().get(ligne.get("id_individu"))
+                nom = fiche["nom"] if fiche else ligne["individu"]
+                sous_titre = fiches.resume_identite(fiche).split("  ·  ", 1)[-1] if fiche else ligne.get("espece", "")
+                if fiche and fiche.get("naissance"):
+                    sous_titre = f"{fiche['espece']}  ·  {fiches.age_lisible(fiche['naissance'])}"
+                dossier_clips = self.dossier / "partage" / "clips"
+                sortie = clips.faire_clip(source, dossier_clips / clips.nom_clip(ligne, nom), nom, sous_titre,
+                                          lire_positions(self.dossier).get(ligne["id_visite"], []),
+                                          f"{ligne['date'][8:10]}/{ligne['date'][5:7]}/{ligne['date'][:4]}",
+                                          decale=clips.decalage(ligne))
+                clips.menage(dossier_clips)
+                if not sortie and auto:
+                    self.dernier_clip.pop(ligne.get("id_individu"), None)
+                if sortie:
+                    self.messages.put(("message", f"🎬 Clip prêt : {sortie.name} (partage\\clips, et sur le téléphone)"))
+                elif not auto:
+                    self.messages.put(("message", "Clip impossible : visite trop courte ou vidéo illisible"))
+            except Exception as e:          # un clip raté ne doit pas arrêter le fil
+                journaliser_erreur(e)
+                if not auto:
+                    self.messages.put(("message", f"Clip impossible : {type(e).__name__}"))
+
+    def _demander_clip(self, ligne):
+        self.file_clips.put((ligne, False, 0))
+        self.lbl_etat.configure(text="🎬 Clip vertical en préparation…")
+
+    def _clip_auto(self, ligne):
+        """Un clip par tortue reconnue toutes les 3 h au plus, pour une visite d'au moins 15 s."""
+        cle = ligne.get("id_individu")
+        fiche = self.registre.fiches.get(cle)
+        if not (self.cfg["clips_auto"] and fiche and not fiche.get("provisoire") and ligne.get("video")
+                and secondes(ligne) >= 15 and time.time() - self.dernier_clip.get(cle, 0) >= 3 * 3600):
+            return
+        self.dernier_clip[cle] = time.time()
+        self.file_clips.put((ligne, True, 0))
+
     def _sauvegarde_auto(self):
         self._sauvegarde_maintenant()
+        self._verifier_alertes()
         if self.root.winfo_exists():
             self.root.after(3600 * 1000, self._sauvegarde_auto)     # revérifié toutes les heures
 
@@ -1907,7 +2152,10 @@ class App:
             if not valeurs["nom"]:
                 messagebox.showerror("Fiche", "Le nom ne peut pas être vide.", parent=f)
                 return False
-            fi = self.registre.copie_fiches()[cle]
+            fi = self.registre.copie_fiches().get(cle)
+            if fi is None:                      # fusionnée ou supprimée entre-temps
+                self._fermer_fiche(cle)
+                return False
             renomme = (valeurs["nom"], valeurs["espece"]) != (fi["nom"], fi["espece"])
             if renomme:
                 if not self._journal_libre(renommer_dans_journal, self.dossier, cle, valeurs["nom"], valeurs["espece"]):
@@ -2080,9 +2328,13 @@ class App:
         ttk.Label(cadre_carnet, text="Vermifuge, visite chez le vétérinaire, hibernation, ponte, blessure… "
                                      "Clic droit sur une ligne pour la retirer.", style="Discret.TLabel").pack(anchor="w", pady=(6, 0))
 
+        notes_affichees = {}                    # ligne -> note montrée (le téléphone peut en ajouter entre-temps)
+
         def carnet():
             liste.delete(*liste.get_children())
+            notes_affichees.clear()
             for rang, n in reversed(list(enumerate(self.registre.carnet(cle)))):
+                notes_affichees[str(rang)] = n
                 liste.insert("", "end", iid=str(rang), values=(f"{n['date'][8:]}/{n['date'][5:7]}/{n['date'][:4]}",
                                                                n.get("type", ""), n["texte"]))
 
@@ -2092,6 +2344,9 @@ class App:
                 if jour > datetime.now().date():
                     raise ValueError("date dans le futur")
                 self.registre.ajouter_note(cle, jour.isoformat(), v_type.get().strip() or "Note", v_texte.get())
+            except KeyError:
+                self._fermer_fiche(cle)
+                return
             except ValueError as e:
                 messagebox.showerror("Carnet", f"Note refusée : {e}\nDate au format 08/11/2026.", parent=f)
                 return
@@ -2104,7 +2359,7 @@ class App:
                 return
             liste.selection_set(rang)
             m = tk.Menu(f, tearoff=0)
-            m.add_command(label="Retirer cette note", command=lambda: (self.registre.retirer_note(cle, int(rang)), carnet()))
+            m.add_command(label="Retirer cette note", command=lambda: (self.registre.retirer_note(cle, int(rang), notes_affichees.get(rang)), carnet()))
             m.tk_popup(ev.x_root, ev.y_root)
 
         ttk.Button(saisie, text="Noter", style="Vert.TButton", command=noter).grid(row=1, column=3)
@@ -2114,7 +2369,7 @@ class App:
 
         # --- fermeture : ne pas perdre une identité modifiée
         def fermer():
-            if modifiee():
+            if cle in self.registre.fiches and modifiee():
                 choix = messagebox.askyesnocancel("Fiche", "Enregistrer les modifications de l'identité ?", parent=f)
                 if choix is None or (choix and not enregistrer()):
                     return
@@ -2122,6 +2377,7 @@ class App:
             f.destroy()
 
         f.protocol("WM_DELETE_WINDOW", fermer)
+        f.fermer = fermer                       # appelé aussi en quittant Broutille
         f.bind("<Escape>", lambda _e: fermer())
         onglets.bind("<<NotebookTabChanged>>",
                      lambda _e: photos() if onglets.index("current") == 2 else None)
@@ -2202,6 +2458,10 @@ class App:
                 if jour > datetime.now().date():
                     raise ValueError("date dans le futur")
                 self.registre.ajouter_pesee(cle, jour.isoformat(), grammes, v_note.get())
+            except KeyError:                    # tortue fusionnée ou supprimée pendant la saisie
+                if f.winfo_toplevel() is not self.root:
+                    f.winfo_toplevel().destroy()
+                return
             except ValueError as e:
                 messagebox.showerror("Pesée", f"Pesée refusée : {e}\nDate au format 05/11/2026, poids en grammes (ex. 1250).",
                                      parent=f.winfo_toplevel())
@@ -2247,6 +2507,11 @@ class App:
         os.startfile(chemin)
 
     def quitter(self):
+        for cle, f in list(self.fenetres_fiche.items()):
+            if f.winfo_exists() and hasattr(f, "fermer"):
+                f.fermer()
+                if f.winfo_exists():            # « Annuler » : on ne quitte pas
+                    return
         self._ecrire_config()
         if self.serveur_web:
             self.serveur_web.arreter()

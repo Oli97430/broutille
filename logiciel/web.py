@@ -11,6 +11,7 @@ Internet. Sans dépendance : http.server de Python, page HTML intégrée.
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import socket
 import tempfile
@@ -20,7 +21,7 @@ from datetime import date, datetime
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import numpy as np
@@ -38,7 +39,8 @@ PAUSE_ECHEC_S = 1.0                   # chaque code faux coûte une seconde : es
 
 
 def nouveau_code():
-    return f"{secrets.randbelow(10 ** 6):06d}"
+    # 8 chiffres : même au rythme maximal permis par les blocages, des siècles pour le deviner
+    return f"{secrets.randbelow(10 ** 8):08d}"
 
 
 def adresse_locale():
@@ -92,8 +94,16 @@ class Serveur:
         class Gestion(_Gestion):
             app = serveur
 
+        self.actif = True
+        self.connexions = set()         # sockets ouvertes : coupées net à l'arrêt (code changé, accès coupé)
+        self._verrou_cnx = threading.Lock()
+        self.flux = threading.BoundedSemaphore(3)       # directs MJPEG simultanés
+        self.envois = threading.BoundedSemaphore(2)     # photos reçues en même temps
+        self._image = (0.0, None)       # dernière image encodée, partagée entre spectateurs
+        self._verrou_image = threading.Lock()
         self.httpd = ThreadingHTTPServer((hote, port), Gestion)
         self.httpd.daemon_threads = True
+        self.httpd.handle_error = lambda *_: None      # téléphone parti, connexion coupée à l'arrêt : rien à signaler
         self.port = self.httpd.server_address[1]
         self.fil = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
@@ -102,8 +112,16 @@ class Serveur:
         return self
 
     def arreter(self):
+        self.actif = False              # une connexion encore ouverte n'est plus autorisée
         self.httpd.shutdown()
         self.httpd.server_close()
+        with self._verrou_cnx:
+            ouvertes = list(self.connexions)
+        for c in ouvertes:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def url(self, avec_code=True):
         base = f"http://{adresse_locale()}:{self.port}/"
@@ -111,7 +129,17 @@ class Serveur:
 
     # --- images
     def image_direct(self, largeur=960):
-        """JPEG de l'image en cours, avec le nom des tortues reconnues ; None sans surveillance."""
+        """JPEG de l'image en cours, avec le nom des tortues reconnues ; None sans surveillance.
+        Encodée une fois pour tous les spectateurs (au plus ~6 fois par seconde)."""
+        with self._verrou_image:
+            t, jpeg = self._image
+            if jpeg is not None and time.time() - t < 0.15:
+                return jpeg
+            jpeg = self._encoder_direct(largeur)
+            self._image = (time.time(), jpeg)
+            return jpeg
+
+    def _encoder_direct(self, largeur):
         donnees = self.source()
         if not donnees:
             return None
@@ -178,7 +206,18 @@ class Serveur:
         return {"surveillance": donnees is not None,
                 "presence": donnees[1].get("presence", 0) if donnees else 0,
                 "aujourdhui": [{"nom": n, "duree": duree_lisible(s)} for n, s in sorted(temps.items(), key=lambda x: -x[1])],
-                "derniere": derniere, "tortues": tortues, "heure": datetime.now().strftime("%H:%M")}
+                "derniere": derniere, "tortues": tortues, "heure": datetime.now().strftime("%H:%M"),
+                "clips": [p.name for p in self.clips()[:12]]}
+
+    def clips(self):
+        d = Path(self.dossier()) / "partage" / "clips"
+        liste = []
+        for p in d.glob("*.mp4") if d.is_dir() else []:
+            try:
+                liste.append((p.stat().st_mtime, p))
+            except OSError:             # effacé par le ménage entre-temps
+                pass
+        return [p for _t, p in sorted(liste, reverse=True)]
 
     def tortue(self, cle):
         f = self.registre.copie_fiches().get(cle)
@@ -226,9 +265,50 @@ class Serveur:
         return False
 
 
+HOTE_PERMIS = re.compile(r"^(\d{1,3}(\.\d{1,3}){3}|localhost|\[[0-9a-fA-F:]+\])(:\d+)?$")
+NOM_IMAGE = re.compile(r"^[\w.-]+\.jpg$")
+
+
 class _Gestion(BaseHTTPRequestHandler):
     app = None
     protocol_version = "HTTP/1.1"
+    timeout = 20                        # une connexion muette ne garde pas un fil pour toujours
+
+    def setup(self):
+        super().setup()
+        with self.app._verrou_cnx:
+            self.app.connexions.add(self.connection)
+
+    def finish(self):
+        with self.app._verrou_cnx:
+            self.app.connexions.discard(self.connection)
+        try:
+            super().finish()
+        except OSError:
+            pass
+
+    def _hote_ok(self):
+        """Adresse IP ou localhost seulement : une page web piégée qui ferait pointer son nom de
+        domaine vers ce PC (« DNS rebinding ») est refusée."""
+        if HOTE_PERMIS.match(self.headers.get("Host", "")):
+            return True
+        self._envoyer(421, "hôte refusé", "text/plain")
+        self.close_connection = True
+        return False
+
+    def _proteger(self, traitement):
+        if not self._hote_ok():
+            return
+        try:
+            traitement()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+            self.close_connection = True
+        except Exception:               # jamais de connexion coupée sans réponse
+            self.close_connection = True
+            try:
+                self._envoyer(500, "erreur", "text/plain")
+            except OSError:
+                pass
 
     def log_message(self, *_):      # pas de bavardage dans la console
         pass
@@ -255,7 +335,7 @@ class _Gestion(BaseHTTPRequestHandler):
         return c["broutille"].value if "broutille" in c else ""
 
     def _autorise(self):
-        return hmac.compare_digest(self._cookie().encode(), self.app.jeton.encode())
+        return self.app.actif and hmac.compare_digest(self._cookie().encode(), self.app.jeton.encode())
 
     def _lire_corps(self, maxi):
         try:
@@ -263,6 +343,7 @@ class _Gestion(BaseHTTPRequestHandler):
         except ValueError:
             raise ValueError("taille illisible") from None
         if not 0 <= n <= maxi:          # négatif : read(-1) lirait jusqu'à la fin, sans limite
+            self.close_connection = True    # corps non lu : la connexion ne peut pas resservir
             raise ValueError("taille refusée")
         return self.rfile.read(n)
 
@@ -281,6 +362,9 @@ class _Gestion(BaseHTTPRequestHandler):
 
     # --- GET
     def do_GET(self):
+        self._proteger(self._get)
+
+    def _get(self):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         ip = self.client_address[0]
@@ -295,10 +379,7 @@ class _Gestion(BaseHTTPRequestHandler):
         if not self._autorise():
             self._envoyer(200 if url.path == "/" else 403, PAGE_CODE.replace("{erreur}", ""))
             return
-        try:
-            self._route_get(url.path, q)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
+        self._route_get(unquote(url.path), q)
 
     def _route_get(self, chemin, q):
         a = self.app
@@ -314,8 +395,8 @@ class _Gestion(BaseHTTPRequestHandler):
         elif chemin == "/direct.mjpg":
             self._mjpeg()
         elif chemin.startswith("/img/visite/"):
-            nom = Path(chemin).name
-            if nom.endswith(".jpg"):
+            nom = chemin[len("/img/visite/"):]
+            if NOM_IMAGE.match(nom):        # pas de « E:x.jpg » ni de chemin : un nom de photo, rien d'autre
                 self._fichier_image(Path(a.dossier()) / nom)
             else:
                 self._envoyer(404, "", "text/plain")
@@ -323,6 +404,13 @@ class _Gestion(BaseHTTPRequestHandler):
             cle = Path(chemin).name
             p = a.registre.photo_profil(cle) if cle in a.registre.fiches else None
             self._fichier_image(p) if p else self._envoyer(404, "", "text/plain")
+        elif chemin.startswith("/clips/"):
+            nom = Path(chemin).name
+            fichier = next((p for p in a.clips() if p.name == nom), None)     # seulement un clip de la liste
+            if fichier:
+                self._envoyer_video(fichier, telecharger="telecharger" in q)
+            else:
+                self._envoyer(404, "", "text/plain")
         elif chemin.startswith("/img/album/"):
             morceaux = chemin.split("/")
             if len(morceaux) == 5 and morceaux[3] in a.registre.fiches:
@@ -332,8 +420,57 @@ class _Gestion(BaseHTTPRequestHandler):
         else:
             self._envoyer(404, "introuvable", "text/plain")
 
+    def _envoyer_video(self, chemin, telecharger=False):
+        """MP4 avec prise en charge des plages (Range) : le lecteur vidéo de l'iPhone l'exige."""
+        taille = chemin.stat().st_size
+        debut, fin = 0, taille - 1
+        plage = self.headers.get("Range", "")
+        if plage.startswith("bytes="):
+            a, _, b = plage[6:].split(",")[0].partition("-")
+            try:
+                if a:
+                    debut, fin = int(a), (int(b) if b else taille - 1)
+                elif b:
+                    debut = max(0, taille - int(b))
+            except ValueError:
+                debut, fin = 0, taille - 1
+            if debut > fin or debut >= taille:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{taille}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            fin = min(fin, taille - 1)
+        self.send_response(206 if plage else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(fin - debut + 1))
+        if plage:
+            self.send_header("Content-Range", f"bytes {debut}-{fin}/{taille}")
+        if telecharger:                 # nom accentué : forme RFC 5987, l'en-tête reste en ASCII
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(chemin.name)}")
+        self.end_headers()
+        with open(chemin, "rb") as f:
+            f.seek(debut)
+            reste = fin - debut + 1
+            while reste > 0:
+                bloc = f.read(min(256 * 1024, reste))
+                if not bloc:
+                    break
+                self.wfile.write(bloc)
+                reste -= len(bloc)
+
     def _mjpeg(self):
         """Direct en MJPEG, ~5 images/s : lu tel quel par la balise <img> du navigateur du téléphone."""
+        if not self.app.flux.acquire(blocking=False):
+            self._envoyer(503, "trop de directs ouverts", "text/plain")
+            return
+        try:
+            self._flux_mjpeg()
+        finally:
+            self.app.flux.release()
+
+    def _flux_mjpeg(self):
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=image")
         self.send_header("Cache-Control", "no-store")
@@ -341,7 +478,7 @@ class _Gestion(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         fin = time.time() + 3600             # une heure max par connexion : la page se reconnecte seule
-        while time.time() < fin:
+        while time.time() < fin and self.app.actif:
             jpeg = self.app.image_direct() or self.app.image_attente()
             self.wfile.write(b"--image\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(jpeg)).encode()
                              + b"\r\n\r\n" + jpeg + b"\r\n")
@@ -350,6 +487,9 @@ class _Gestion(BaseHTTPRequestHandler):
 
     # --- POST
     def do_POST(self):
+        self._proteger(self._post)
+
+    def _post(self):
         url = urlparse(self.path)
         ip = self.client_address[0]
         if url.path == "/connexion":
@@ -374,15 +514,24 @@ class _Gestion(BaseHTTPRequestHandler):
                 cle = q.get("cle", [""])[0]
                 if cle not in a.registre.fiches:
                     raise ValueError("tortue inconnue")
-                corps = self._lire_corps(MAX_PHOTO)
-                nom = nom_fichier(Path(q.get("nom", ["telephone"])[0]).stem)[:30] or "telephone"
-                with tempfile.TemporaryDirectory() as d:
-                    tmp = Path(d) / f"{nom}.jpg"
-                    tmp.write_bytes(corps)
-                    if not a.registre.ajouter_album(cle, [tmp]):
-                        raise ValueError("photo illisible")
+                if not a.envois.acquire(timeout=30):
+                    self.close_connection = True
+                    raise ValueError("occupé : réessayez")
+                try:
+                    corps = self._lire_corps(MAX_PHOTO)
+                    nom = nom_fichier(Path(q.get("nom", ["telephone"])[0]).stem)[:30] or "telephone"
+                    with tempfile.TemporaryDirectory() as d:
+                        tmp = Path(d) / f"{nom}.jpg"
+                        tmp.write_bytes(corps)
+                        del corps
+                        if not a.registre.ajouter_album(cle, [tmp]):
+                            raise ValueError("photo illisible")
+                finally:
+                    a.envois.release()
             else:
                 donnees = json.loads(self._lire_corps(20000) or b"{}")
+                if not isinstance(donnees, dict):
+                    raise ValueError("données illisibles")
                 cle = donnees.get("cle", "")
                 if cle not in a.registre.fiches:
                     raise ValueError("tortue inconnue")
@@ -409,11 +558,11 @@ PAGE_CODE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Broutille</title>
 <style>body{margin:0;background:#10140f;color:#e9eee3;font:17px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}
 form{background:#1b2119;padding:28px;border-radius:16px;width:min(320px,86vw)}h1{margin:0 0 6px}p{color:#97a38d;margin:0 0 18px}
-input{width:100%;box-sizing:border-box;font-size:28px;letter-spacing:8px;text-align:center;padding:12px;border-radius:10px;border:1px solid #2d3729;background:#10140f;color:#e9eee3}
+input{width:100%;box-sizing:border-box;font-size:28px;letter-spacing:6px;text-align:center;padding:12px;border-radius:10px;border:1px solid #2d3729;background:#10140f;color:#e9eee3}
 button{margin-top:14px;width:100%;padding:14px;font-size:17px;font-weight:600;border:0;border-radius:10px;background:#7fb950;color:#10200a}
 .e{color:#f85149;margin-top:12px;min-height:1em}</style></head><body>
 <form method="post" action="/connexion"><h1>Broutille</h1><p>Code affiché dans l'application, bouton 📱 Téléphone.</p>
-<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" autofocus>
+<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" autofocus>
 <button>Entrer</button><div class="e">{erreur}</div></form></body></html>"""
 
 PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -438,12 +587,15 @@ label{display:block;font-size:13px;color:var(--discret);margin:10px 0 4px}input,
 button.sec{background:var(--bord);color:var(--texte)}.album{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.album img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px}
 .msg{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--vert);color:#10200a;padding:10px 18px;border-radius:20px;font-weight:600;display:none;z-index:9}
 .msg.err{background:var(--rouge);color:#fff}
+.clip{display:flex;gap:12px;padding:8px 0;border-bottom:1px solid var(--bord)}.clip:last-child{border:0}.clip video{width:110px;aspect-ratio:9/16;border-radius:8px;background:#000;object-fit:cover}
+.clip a.b{display:inline-block;width:auto;margin-top:8px;padding:8px 14px;border-radius:10px;background:var(--vert);color:#10200a;font-weight:600;text-decoration:none}
 </style></head><body>
 <header><h1>🐢 Broutille</h1><span id="pastille" class="pastille">…</span></header>
 <img class="video" id="video" src="/direct.mjpg" alt="Direct de la mangeoire">
 <section><h2>Aujourd'hui à table</h2><div id="aujourdhui" class="discret">…</div></section>
 <section><h2>Dernière visite</h2><div id="derniere" class="discret">…</div></section>
 <section><h2>Mes tortues</h2><div id="tortues" class="tortues"></div></section>
+<section><h2>🎬 Clips à partager</h2><div id="clips" class="clips discret">…</div></section>
 <dialog id="fiche"></dialog><div id="msg" class="msg"></div>
 <script>
 const $=s=>document.querySelector(s), esc=t=>String(t??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -454,7 +606,7 @@ async function etat(){try{const e=await api("/api/etat");
  const p=$("#pastille");p.textContent=!e.surveillance?"● En veille":e.presence?`● ${e.presence} à table`:"● Surveillance";p.className="pastille"+(e.presence?" table":e.surveillance?" on":"");
  $("#aujourdhui").innerHTML=e.aujourdhui.length?e.aujourdhui.map(x=>`<div class="ligne"><span>${esc(x.nom)}</span><span class="discret">${esc(x.duree)}</span></div>`).join(""):"Pas encore de repas";
  const d=e.derniere;$("#derniere").innerHTML=d?`<div class="derniere">${d.photo?`<img src="/img/visite/${encodeURIComponent(d.photo)}">`:""}<div><b>${esc(d.nom)}</b><br><span class="discret">${esc(d.quand)} · ${esc(d.duree)}</span></div></div>`:"Aucune visite";
- $("#tortues").innerHTML=e.tortues.map(t=>`<button class="t" onclick="fiche('${esc(t.cle)}')"><img loading="lazy" src="/img/portrait/${esc(t.cle)}" onerror="this.style.visibility='hidden'"><div><b>${esc(t.nom)}</b><small>${t.vue?"vue le "+esc(t.vue):"jamais vue"}${t.poids?" · <span class='"+(t.alerte_poids?"alerte":"")+"'>"+esc(t.poids)+"</span>":""}</small></div></button>`).join("");
+ clips(e.clips||[]);$("#tortues").innerHTML=e.tortues.map(t=>`<button class="t" onclick="fiche('${esc(t.cle)}')"><img loading="lazy" src="/img/portrait/${esc(t.cle)}" onerror="this.style.visibility='hidden'"><div><b>${esc(t.nom)}</b><small>${t.vue?"vue le "+esc(t.vue):"jamais vue"}${t.poids?" · <span class='"+(t.alerte_poids?"alerte":"")+"'>"+esc(t.poids)+"</span>":""}</small></div></button>`).join("");
 }catch(e){}}
 async function fiche(cle){const t=await api("/api/tortue?cle="+encodeURIComponent(cle));const f=$("#fiche");
  f.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:start"><div><h1>${esc(t.nom)}</h1><div style="color:var(--ambre)">${esc(t.identite)}</div>${t.signes?`<div class="discret">${esc(t.signes)}</div>`:""}</div><button class="b sec" style="width:auto;margin:0;padding:8px 14px" onclick="fiche_fermer()">✕</button></div>
@@ -474,5 +626,7 @@ async function envoyer(cle,fichiers){let n=0;for(const f of fichiers){try{await 
  if(n){message(n+" photo"+(n>1?"s":"")+" ajoutée"+(n>1?"s":""));fiche(cle);etat()}}
 $("#video").onerror=()=>setTimeout(()=>$("#video").src="/direct.mjpg?"+Date.now(),3000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden){$("#video").src="/direct.mjpg?"+Date.now();etat()}});
+function clips(liste){const c=$("#clips");const avant=c.dataset.liste||"";const maintenant=liste.join("|");if(avant===maintenant)return;c.dataset.liste=maintenant;
+ c.innerHTML=liste.length?liste.map(n=>`<div class="clip"><video controls playsinline preload="metadata" src="/clips/${encodeURIComponent(n)}#t=0.5"></video><div><b>${esc(n.slice(17,-4).replace(/_/g," "))}</b><br><span class="discret">${esc(n.slice(8,10)+"/"+n.slice(5,7)+" à "+n.slice(11,16).replace("-",":"))}</span><br><a class="b" href="/clips/${encodeURIComponent(n)}?telecharger=1" download>⬇ Télécharger</a></div></div>`).join(""):"Pas encore de clip : il s'en fait un après la visite d'une tortue reconnue."}
 etat();setInterval(etat,10000);
 </script></body></html>"""

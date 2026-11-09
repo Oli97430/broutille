@@ -5,6 +5,7 @@ Un raccourci « Broutille.lnk » dans le dossier Démarrage de l'utilisateur lan
 console. Il est créé ou retiré depuis les Réglages ; aucun droit administrateur n'est demandé.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -35,10 +36,11 @@ def _pythonw():
     return candidat if candidat.exists() else Path(sys.executable)
 
 
-def _powershell(script):
+def _powershell(script, **env):
+    """env : valeurs lues par le script dans $env:NOM, jamais collées dans son texte."""
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       capture_output=True, text=True, timeout=30,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                       capture_output=True, text=True, timeout=30, encoding="oem", errors="replace",
+                       env={**os.environ, **env}, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if r.returncode != 0:
         raise OSError(r.stderr.strip() or "raccourci impossible")
 
@@ -52,15 +54,18 @@ def activer(cible=None):
     cible : dossier de destination du raccourci (essais) ; par défaut le dossier Démarrage."""
     lien = Path(cible) / NOM_RACCOURCI if cible else raccourci()
     lien.parent.mkdir(parents=True, exist_ok=True)
-    echapper = lambda t: str(t).replace("'", "''")
+    # chemins passés par l'environnement, jamais collés dans le script : une apostrophe
+    # (même typographique, que PowerShell lit aussi comme guillemet) ne peut rien casser
     _powershell(
-        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('" + echapper(lien) + "');"
-        "$s.TargetPath = '" + echapper(_pythonw()) + "';"
-        "$s.Arguments = '\"" + echapper(ICI / "broutille_app.py") + "\" --demarrage';"
-        "$s.WorkingDirectory = '" + echapper(ICI) + "';"
-        "$s.IconLocation = '" + echapper(ICI / "broutille.ico") + "';"
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:BR_LIEN);"
+        "$s.TargetPath = $env:BR_CIBLE;"
+        "$s.Arguments = '\"' + $env:BR_SCRIPT + '\" --demarrage';"
+        "$s.WorkingDirectory = $env:BR_DOSSIER;"
+        "$s.IconLocation = $env:BR_ICONE;"
         "$s.Description = 'Broutille : surveillance de la mangeoire';"
-        "$s.Save()")
+        "$s.Save()",
+        BR_LIEN=str(lien), BR_CIBLE=str(_pythonw()), BR_SCRIPT=str(ICI / "broutille_app.py"),
+        BR_DOSSIER=str(ICI), BR_ICONE=str(ICI / "broutille.ico"))
     return lien
 
 
@@ -89,10 +94,15 @@ def lancer_programme(chemin, sans_admin=False):
 
 def lire_raccourci(lien):
     """(cible, arguments, dossier) d'un raccourci, pour les essais."""
+    # sortie en JSON échappé ASCII : ni page de code OEM, ni champ vide qui décale les autres
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('" + str(lien).replace("'", "''") + "');"
-                        "$s.TargetPath; $s.Arguments; $s.WorkingDirectory"],
-                       capture_output=True, text=True, timeout=30, encoding="oem", errors="replace",
+                        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:BR_LIEN);"
+                        "[Console]::Out.Write((ConvertTo-Json -Compress @($s.TargetPath, $s.Arguments, $s.WorkingDirectory))"
+                        " -replace '[^\\x00-\\x7f]', { '\\u{0:x4}' -f [int][char]$args[0].Value })"],
+                       capture_output=True, text=True, timeout=30, encoding="ascii", errors="replace",
+                       env={**os.environ, "BR_LIEN": str(lien)},
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    # PowerShell redirigé écrit dans la page de code OEM (cp850) : « Vidéos » resterait illisible en ANSI
-    return tuple(r.stdout.strip().splitlines())
+    try:
+        return tuple(str(v or "") for v in json.loads(r.stdout))
+    except ValueError:
+        return ()

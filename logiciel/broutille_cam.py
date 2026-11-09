@@ -21,6 +21,7 @@ Pour chaque tortue :
 """
 
 import argparse
+import collections
 import csv
 import json
 import queue
@@ -74,6 +75,8 @@ def _date_photo(img, chemin):
     """Date de prise de vue (EXIF DateTimeOriginal), sinon date du fichier."""
     try:
         brut = img.getexif().get_ifd(0x8769).get(0x9003) or img.getexif().get(0x0132)
+        if isinstance(brut, bytes):
+            brut = brut.decode("ascii", "ignore")
         if brut:
             return datetime.strptime(str(brut).strip("\x00 ")[:19], "%Y:%m:%d %H:%M:%S")
     except (ValueError, KeyError, AttributeError, OSError):
@@ -150,10 +153,12 @@ def _lire_csv(chemin):
         except UnicodeDecodeError:
             textes.append(ligne.decode("cp1252", "replace"))
     lignes = []
-    for l in csv.DictReader(textes, delimiter=";"):
-        if None in l or None in l.values() or not l.get("date") or not l.get("id_visite"):
+    for l in csv.DictReader(textes, delimiter=";", restval=""):
+        l.pop(None, None)               # champs en trop (Excel, ancienne version) : ignorés, la ligne reste
+        # ligne coupée par une panne : date incomplète ou nom absent. Excel, lui, n'ôte que des champs de fin vides.
+        if not l.get("id_visite") or len(l.get("date") or "") != 10 or not l.get("heure") or not l.get("individu"):
             continue
-        lignes.append(l)
+        lignes.append({c: (v if v is not None else "") for c, v in l.items()})
     return lignes
 
 
@@ -239,7 +244,9 @@ def ecrire_positions(dossier, id_visite, piste):
         if nouveau:
             f.write(ENTETE_POSITIONS)
         for instant, x, y, l, h in piste.trajet:
-            f.write(f"{id_visite};{instant - piste.debut:.1f};{x};{y};{l};{h};{il};{ih}\n")
+            # l'heure du journal est tronquée à la seconde : on y ajoute la fraction, pour que deux
+            # tortues présentes ensemble aient des temps comparables
+            f.write(f"{id_visite};{instant - piste.debut + piste.arrivee.microsecond / 1e6:.1f};{x};{y};{l};{h};{il};{ih}\n")
 
 
 def lire_positions(dossier):
@@ -336,10 +343,14 @@ class Registre:
     def _ecrire(self):
         self.dossier.mkdir(parents=True, exist_ok=True)
         if self.chemin.exists():
-            shutil.copy2(self.chemin, self.chemin.with_suffix(".bak"))
+            try:
+                json.loads(self.chemin.read_text(encoding="utf-8"))
+                shutil.copy2(self.chemin, self.chemin.with_suffix(".bak"))
+            except (OSError, ValueError):
+                pass                    # fichier principal abîmé : la copie .bak reste la bonne
         tmp = self.chemin.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.fiches, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.chemin)
+        _insister(lambda: tmp.replace(self.chemin))     # antivirus, OneDrive : verrou passager
 
     def copie_fiches(self):
         """Fiches à parcourir depuis un autre fil."""
@@ -407,8 +418,10 @@ class Registre:
 
     def nom_provisoire(self, espece):
         court = espece.replace("Tortue ", "").replace("d'", "").capitalize()
-        n = 1 + sum(1 for f in self.fiches.values() if f["nom"].startswith(f"{court} n°"))
-        while any(f["nom"] == f"{court} n°{n}" for f in self.fiches.values()):
+        with self._verrou:
+            noms = [f["nom"] for f in self.fiches.values()]
+        n = 1 + sum(1 for nom in noms if nom.startswith(f"{court} n°"))
+        while f"{court} n°{n}" in noms:
             n += 1
         return f"{court} n°{n}"
 
@@ -554,9 +567,13 @@ class Registre:
             self.fiches[cle]["carnet"] = sorted(carnet, key=lambda n: n["date"])
             self._ecrire()
 
-    def retirer_note(self, cle, rang):
+    def retirer_note(self, cle, rang, attendue=None):
+        """Retire la note n° rang. attendue : la note affichée ; si une note ajoutée entre-temps (depuis
+        le téléphone) a décalé les rangs, c'est elle qu'on cherche, et rien n'est retiré si elle a disparu."""
         with self._verrou:
             carnet = list(self.fiches[cle].get("carnet", []))
+            if attendue is not None and not (0 <= rang < len(carnet) and carnet[rang] == attendue):
+                rang = next((i for i, n in enumerate(carnet) if n == attendue), -1)
             if 0 <= rang < len(carnet):
                 del carnet[rang]
                 self.fiches[cle]["carnet"] = carnet
@@ -581,8 +598,9 @@ class Registre:
         for chemin in chemins:
             chemin = Path(chemin)
             try:
-                with Image.open(chemin) as img:
+                with Image.open(chemin, formats=["JPEG", "PNG", "WEBP", "HEIF", "MPO"]) as img:
                     quand = _date_photo(img, chemin)
+                    img.draft("RGB", (2000, 2000))
                     img = ImageOps.exif_transpose(img).convert("RGB")
                     img.thumbnail((2000, 2000))
                     base = f"{quand:%Y-%m-%d_%H-%M-%S}_{nom_fichier(chemin.stem)[:30]}"
@@ -590,9 +608,11 @@ class Registre:
                     while cible.exists():
                         n += 1
                         cible = d / f"{base}_{n}.jpg"
-                    img.save(cible, quality=90)
+                    partiel = cible.with_name(cible.name + ".part")
+                    img.save(partiel, "JPEG", quality=90)
+                    partiel.replace(cible)          # jamais de photo à moitié écrite dans l'album
                     ecrits.append(cible.name)
-            except (OSError, ValueError):
+            except Exception:           # image énorme (bombe de décompression), format exotique… : ignorée
                 continue
         return ecrits
 
@@ -739,7 +759,8 @@ class Piste:
         return meilleure, float(np.mean([s for _t, s in sures]))
 
     def probable(self):
-        return max(self.proposition, key=self.proposition.get) if self.proposition else None
+        prop = dict(self.proposition)       # le fil d'analyse peut l'enrichir pendant ce temps
+        return max(prop, key=prop.get) if prop else None
 
 
 def ressemblance_galerie(classeur, galerie, image, boite):
@@ -781,9 +802,10 @@ class LecteurCamera(threading.Thread):
     bloquent read() sans limite, et la surveillance doit rester libre de réagir ou de s'arrêter.
     Mesure aussi les vraies images par seconde : ce qu'annonce une caméra est souvent faux."""
 
-    def __init__(self, source, sur_message):
+    def __init__(self, source, sur_message, insister=False):
         super().__init__(daemon=True)
         self.source, self.sur_message = source, sur_message
+        self.insister = insister        # relancé après un gel : réessayer sans fin au lieu d'abandonner
         self.file = queue.Queue(maxsize=60)
         self.pret, self.fin = threading.Event(), threading.Event()
         self.echec = False
@@ -811,7 +833,7 @@ class LecteurCamera(threading.Thread):
             self.file.put_nowait((image, maintenant))
 
     def run(self):
-        premiere = True
+        premiere = not self.insister
         while not self.fin.is_set():
             camera, image = ouvrir_source(self.source)
             if camera is None:
@@ -889,6 +911,7 @@ class Surveillance:
         self._verrou = threading.Lock()
         self.fichier = est_fichier(self.source)
         self.video, self.chemin_clip, self.nb_clip, self.debut_clip = None, None, 0, 0.0
+        self._clips_en_attente = collections.Counter()   # clip -> visites pas encore écrites au journal
         self.duree_analyse = 0.0
         self._taches = queue.Queue()
 
@@ -918,7 +941,10 @@ class Surveillance:
 
     # --- clip
     def _ouvrir_clip(self, fps, taille, tampon, instant):
-        base = self.dossier / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # nommé d'après sa première image (le tampon d'avant l'arrivée) : le nom donne le vrai début,
+        # dont se servent les clips verticaux pour retrouver l'arrivée de chaque tortue
+        avance = max(0.0, instant - tampon[0][0]) if tampon else 0.0
+        base = self.dossier / (datetime.now() - timedelta(seconds=avance)).strftime("%Y-%m-%d_%H-%M-%S")
         chemin, n = base.with_suffix(".mp4"), 1
         while chemin.exists():
             n += 1
@@ -939,9 +965,16 @@ class Surveillance:
             self.video = None
             self._tache(self._nettoyer_clip, self.chemin_clip.name)
 
+    def _planifier_fin(self, piste):
+        """Fin de visite confiée au fil des tâches ; son clip est protégé du ménage jusqu'à ce que
+        la ligne du journal soit écrite."""
+        if piste.clip:
+            self._clips_en_attente[piste.clip] += 1
+        self._tache(self._terminer_piste, piste)
+
     def _nettoyer_clip(self, nom):
         """Fausse alerte : aucune visite ne cite ce clip, et aucune tortue encore là."""
-        if not nom or (self.video is not None and self.chemin_clip.name == nom):
+        if not nom or (self.video is not None and self.chemin_clip.name == nom) or self._clips_en_attente[nom] > 0:
             return
         with self._verrou:
             if any(p.clip == nom for p in self.pistes):
@@ -1024,7 +1057,7 @@ class Surveillance:
         return True
 
     def _seuil_image(self):
-        unique = sum(g is not None for g in self.registre.vecteurs.values()) <= 1
+        unique = sum(g is not None for g in list(self.registre.vecteurs.values())) <= 1
         return self.seuil + (SUPPLEMENT_FICHE_UNIQUE if unique else 0.0)
 
     def _reconnaitre(self, piste, image, boite, instant, isolee):
@@ -1068,14 +1101,23 @@ class Surveillance:
                 if isolee:
                     r.ajouter_exemple(cle, tortue, f"{base_visite}_{i}.jpg")
                 continue
-            if vecteurs is None or not (nouvelle or (tete == cle and score >= SEUIL_PROPOSITION and isolee)):
+            if vecteurs is None or not isolee or not (nouvelle or (tete == cle and score >= SEUIL_PROPOSITION)):
                 continue
             g = r.vecteurs.get(cle)
             if g is None or float((vecteurs @ g.T).max()) < EXEMPLE_DIFFERENT:
                 r.ajouter_exemple(cle, tortue, f"{base_visite}_{i}.jpg")
 
     def _terminer_piste(self, piste):
-        """Écrit la ligne du journal d'une tortue partie ; renvoie la ligne, ou None si fausse alerte."""
+        try:
+            return self._terminer_piste_(piste)
+        finally:
+            if piste.clip:
+                self._clips_en_attente[piste.clip] -= 1
+
+    def _terminer_piste_(self, piste):
+        """Écrit la ligne du journal d'une tortue partie ; renvoie la ligne, ou None si fausse alerte.
+        La ligne passe avant tout : une galerie ou une photo ratée (disque plein, antivirus) ne
+        fait jamais perdre la visite."""
         duree = max(0.0, piste.vue - piste.debut)
         r = self.registre
         if piste.nommee == PAS_UNE_TORTUE:          # désignée sur la vidéo : ignorée la prochaine fois
@@ -1094,29 +1136,34 @@ class Surveillance:
         if manuelle:
             cle, score, source = r.resoudre(piste.nommee), 1.0, "manuel"
         if cle is None and self.reconnaissance_active and self.creer_nouvelles and len(piste.exemples) >= 2:
-            cle = r.creer(r.nom_provisoire(espece), espece, provisoire=True)
-            score, source, nouvelle = 0.0, "nouvelle", True
-            self.sur_message(f"Nouvelle tortue : {r.fiches[cle]['nom']}")
+            try:
+                cle = r.creer(r.nom_provisoire(espece), espece, provisoire=True)
+                score, source, nouvelle = 0.0, "nouvelle", True
+                self.sur_message(f"Nouvelle tortue : {r.fiches[cle]['nom']}")
+            except OSError as e:
+                self.sur_message(f"Fiche nouvelle impossible : {e}")
         base_visite = f"{piste.arrivee:%Y-%m-%d_%H-%M-%S}_{piste.numero}"
-        if cle:
-            self._enrichir_galerie(piste, cle, nouvelle, base_visite, manuelle)
         photo = ""
         if piste.exemples:
-            photo = f"{base_visite}_photo.jpg"
-            ecrire_image(self.dossier / photo, piste.exemples[0][3])
-            ecrire_image(self.dossier / f"{base_visite}_tortue.jpg", piste.exemples[0][1])
-        fiche = r.copie_fiches().get(cle) if cle else None
-        ligne = {"id_visite": base_visite, "date": f"{piste.arrivee:%Y-%m-%d}", "heure": f"{piste.arrivee:%H:%M:%S}",
-                 "duree_s": f"{duree:.0f}", "individu": fiche["nom"] if fiche else INCONNUE,
-                 "espece": fiche["espece"] if fiche else espece, "confiance": f"{min(score, 1):.2f}",
-                 "video": piste.clip or "", "photo": photo, "source": source, "corrige": "1" if manuelle else "",
-                 "id_individu": cle or "",
-                 "proposition": "", "id_proposition": ""}
-        probable = r.resoudre(piste.probable()) if piste.probable() else None
-        if cle is None and probable:
-            ligne.update(proposition=r.fiches[probable]["nom"], id_proposition=probable)
-        if not ajouter_ligne(self.dossier, ligne):
+            try:
+                ecrire_image(self.dossier / f"{base_visite}_photo.jpg", piste.exemples[0][3])
+                ecrire_image(self.dossier / f"{base_visite}_tortue.jpg", piste.exemples[0][1])
+                photo = f"{base_visite}_photo.jpg"
+            except Exception as e:
+                self.sur_message(f"Photo de visite non écrite : {e}")
+        # fiche relue sous le verrou du journal : une fusion ou une suppression faite pendant ce
+        # temps depuis l'application ne laisse pas une visite pointer vers une fiche disparue
+        with VERROU_JOURNAL:
+            cle = r.resoudre(cle) if cle else None
+            ligne = self._ligne_visite(piste, cle, espece, score, source, manuelle, base_visite, photo, duree)
+            ecrite = ajouter_ligne(self.dossier, ligne)
+        if not ecrite:
             self.sur_message("visites.csv est ouvert ailleurs : la visite attend d'y être écrite")
+        if cle:
+            try:
+                self._enrichir_galerie(piste, cle, nouvelle, base_visite, manuelle)
+            except Exception as e:      # galerie pas enrichie cette fois : la visite, elle, est notée
+                self.sur_message(f"Galerie non enrichie : {type(e).__name__} : {e}")
         try:
             ecrire_positions(self.dossier, base_visite, piste)
         except OSError as e:            # positions perdues : la visite, elle, est notée
@@ -1124,6 +1171,22 @@ class Surveillance:
         self.sur_message(f"Fin de visite : {ligne['individu']} ({ligne['espece']}), {duree:.0f} s")
         self.sur_visite(ligne)
         self._nettoyer_clip(piste.clip)
+        return ligne
+
+    def _ligne_visite(self, piste, cle, espece, score, source, manuelle, base_visite, photo, duree):
+        r = self.registre
+        fiche = r.copie_fiches().get(cle) if cle else None
+        ligne = {"id_visite": base_visite, "date": f"{piste.arrivee:%Y-%m-%d}", "heure": f"{piste.arrivee:%H:%M:%S}",
+                 "duree_s": f"{duree:.0f}", "individu": fiche["nom"] if fiche else INCONNUE,
+                 "espece": fiche["espece"] if fiche else espece, "confiance": f"{min(score, 1):.2f}",
+                 "video": piste.clip or "", "photo": photo, "source": source, "corrige": "1" if manuelle else "",
+                 "id_individu": cle or "",
+                 "proposition": "", "id_proposition": ""}
+        probable = piste.probable()
+        probable = r.resoudre(probable) if probable else None
+        fiche_probable = r.copie_fiches().get(probable) if probable else None
+        if cle is None and fiche_probable:
+            ligne.update(proposition=fiche_probable["nom"], id_proposition=probable)
         return ligne
 
     def _menage(self):
@@ -1146,8 +1209,8 @@ class Surveillance:
         return np.count_nonzero(cv2.morphologyEx(masque, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))) > self.surface * masque.size
 
     # --- boucle
-    def _lancer_lecteur(self):
-        self.lecteur = LecteurCamera(self.source, self.sur_message)
+    def _lancer_lecteur(self, insister=False):
+        self.lecteur = LecteurCamera(self.source, self.sur_message, insister)
         self.lecteur.start()
 
     def _suivante_direct(self):
@@ -1158,7 +1221,9 @@ class Surveillance:
             if self.lecteur.en_lecture and time.time() - self.lecteur.derniere > self.SILENCE_MAX:
                 self.sur_message("Source figée : reconnexion…")
                 self.lecteur.fin.set()      # son fil reste bloqué dans read() : on l'abandonne
-                self._lancer_lecteur()
+                self._lancer_lecteur(insister=True)
+            elif not self.lecteur.is_alive() and not self.arret.is_set():
+                self._lancer_lecteur(insister=True)     # lecteur mort (source rouverte sans succès) : on insiste
             return None
 
     def executer(self):
@@ -1289,7 +1354,7 @@ class Surveillance:
                 for piste in [p for p in presentes if instant - p.vue > delai]:
                     with self._verrou:
                         self.pistes.remove(piste)
-                    self._tache(self._terminer_piste, piste)
+                    self._planifier_fin(piste)
 
                 if time.time() - t_menage > 600:
                     t_menage = time.time()
@@ -1310,11 +1375,11 @@ class Surveillance:
         finally:
             if fil is not None:
                 fil.join(30)
-            self._fermer_clip()
-            with self._verrou:
+            with self._verrou:          # visites planifiées avant le ménage de fin du clip
                 restantes, self.pistes = list(self.pistes), []
             for piste in restantes:
-                self._tache(self._terminer_piste, piste)
+                self._planifier_fin(piste)
+            self._fermer_clip()
             self._tache(self._menage)
 
     def _analyser_protege(self, image, instant):
@@ -1360,14 +1425,15 @@ def corriger_visite(dossier, registre, id_visite, cle):
         registre.rejeter(contenus)
         for suffixe in ("_photo.jpg", "_tortue.jpg"):
             (dossier / (id_visite + suffixe)).unlink(missing_ok=True)
-        if avant.get("video") and not any(l["video"] == avant["video"] for l in lire_journal(dossier)):
-            (dossier / avant["video"]).unlink(missing_ok=True)
+        # le clip n'est pas effacé ici : une autre tortue du même clip peut encore être en cours
+        # d'écriture par la surveillance. Le ménage s'en charge quand plus rien ne le cite.
         resultat["individu"] = PAS_UNE_TORTUE
     else:
         registre.deposer_exemples(cle, contenus)
     if ancienne and ancienne != cle and ancienne in registre.fiches and registre.fiches[ancienne].get("provisoire") \
-            and not registre.fichiers.get(ancienne):
-        registre.supprimer(ancienne)    # une tortue provisoire dont il ne reste rien
+            and not registre.fichiers.get(ancienne) \
+            and not any(l.get("id_individu") == ancienne for l in lire_journal(dossier)):
+        registre.supprimer(ancienne)    # une tortue provisoire dont il ne reste rien, ni photo ni visite
     return resultat
 
 
