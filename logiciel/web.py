@@ -18,7 +18,6 @@ import tempfile
 import threading
 import time
 from datetime import date, datetime
-from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -331,8 +330,13 @@ class _Gestion(BaseHTTPRequestHandler):
         self._envoyer(statut, json.dumps(donnees, ensure_ascii=False), "application/json; charset=utf-8")
 
     def _cookie(self):
-        c = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        return c["broutille"].value if "broutille" in c else ""
+        # lu à la main : SimpleCookie abandonne tout l'en-tête si un autre cookie du même PC (autre petit
+        # serveur, page de box) contient une espace ou des guillemets, et le téléphone ne pourrait plus entrer
+        for morceau in self.headers.get("Cookie", "").split(";"):
+            nom, _, valeur = morceau.strip().partition("=")
+            if nom == "broutille":
+                return valeur.strip().strip('"')
+        return ""
 
     def _autorise(self):
         return self.app.actif and hmac.compare_digest(self._cookie().encode(), self.app.jeton.encode())

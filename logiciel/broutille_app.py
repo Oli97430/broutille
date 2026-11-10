@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
 import alertes
 import clips
+import cameras
 import comportement
 import deplacements
 import demarrage
@@ -43,7 +44,9 @@ if (ICI / "hf_cache").is_dir():     # version installée : modèles livrés avec
     os.environ.setdefault("HF_HOME", str(ICI / "hf_cache"))
 CONFIG = Path.home() / ".broutille.json"
 DEFAUTS = {
-    "source": "0",
+    "source": "0",              # source de la caméra affichée (copie de cameras[...]["source"])
+    "cameras": [],              # [{"id", "nom", "source"}] : une surveillance par caméra
+    "camera_courante": "",      # caméra affichée
     "dossier": str(Path.home() / "Videos" / "Broutille"),
     "seuil": SEUIL_INDIVIDU,
     "reconnaissance": True,
@@ -59,7 +62,8 @@ DEFAUTS = {
     "sauvegarde_dossier": "",   # clé USB, OneDrive... ; vide = pas de sauvegarde
     "rappel_pesee_jours": 30,   # tortue en orange si sa dernière pesée est plus ancienne ; 0 = jamais
     "especes_actives": [e[1] for e in vision.ESPECES_DEFAUT[:2]],   # noms scientifiques
-    "zones": {},                # source -> partie de l'image à garder (x0, y0, x1, y1 en fractions)
+    "zones": {},                # source (sans mot de passe) -> partie de l'image à garder (x0, y0, x1, y1 en fractions)
+    "camera_ip": "",            # adresse RTSP de la caméra IP : gardée même quand on choisit une autre source
     "web_actif": False,         # accès depuis le téléphone (Wi-Fi de la maison)
     "web_code": "",             # code à 6 chiffres demandé par le téléphone ; créé au premier usage
     "web_port": 0,              # port retenu (0 = premier libre à partir de 8642)
@@ -89,11 +93,32 @@ def libelle_source(source):
     source = str(source)
     if source.isdigit():
         return f"Webcam {source}"
-    return f"Fenêtre : {source[len(sources.PREFIXE_FENETRE):]}" if sources.est_fenetre(source) else source
+    camera = cameras.lire_adresse(source)
+    if camera:                          # caméra IP : jamais le mot de passe à l'écran
+        return f"Caméra IP : {camera[0]}" + (f" ({camera[3].split('?')[0]})" if camera[3] else "")
+    if sources.est_fenetre(source):
+        return f"Fenêtre : {source[len(sources.PREFIXE_FENETRE):]}"
+    return sources.masquer(source)      # flux http avec identifiants : masqués aussi
 
 
-def source_depuis_saisie(saisie):
+def cle_source(source):
+    """Clé d'une source dans les réglages (cadrage) : sans son mot de passe, qui peut changer."""
+    source = str(source)
+    camera = cameras.lire_adresse(source)
+    if camera:
+        return f"rtsp://{camera[0]}:{camera[4]}/{camera[3]}"
+    return sources.masquer(source) if sources.est_flux(source) else source
+
+
+def source_depuis_saisie(saisie, *connues):
+    """Texte de la liste « Caméra » → source. connues : sources enregistrées (actuelle, caméra IP) ;
+    leur libellé (mot de passe caché) renvoie à elles."""
     saisie = saisie.strip()
+    for connue in connues:
+        if connue and saisie == libelle_source(connue):
+            return str(connue)
+    if saisie.startswith("Caméra IP :"):        # libellé retouché à la main : la caméra enregistrée, pas du texte
+        return next((str(c) for c in connues if c and cameras.lire_adresse(c)), saisie)
     if saisie.startswith("Webcam "):
         return saisie[len("Webcam "):]
     return sources.PREFIXE_FENETRE + saisie[len("Fenêtre : "):] if saisie.startswith("Fenêtre : ") else saisie
@@ -108,18 +133,36 @@ class App:
     def __init__(self, root):
         self.root = root
         self.cfg = {**DEFAUTS, **self._lire_config()}
-        self.surveillance = None
+        for cle, maxi in (("alerte_jours", 3650), ("menage_jours", 3650), ("rappel_pesee_jours", 3650), ("menage_go", 100000)):
+            try:                            # un réglage hors bornes (fichier retouché) ne doit pas empêcher de démarrer
+                self.cfg[cle] = type(DEFAUTS[cle])(min(max(0, self.cfg[cle]), maxi))
+            except (TypeError, ValueError):
+                self.cfg[cle] = DEFAUTS[cle]
+        if not self.cfg.get("camera_ip") and cameras.lire_adresse(self.cfg["source"]):
+            self.cfg["camera_ip"] = self.cfg["source"]
+        self.cfg["zones"] = {cle_source(k): v for k, v in self.cfg["zones"].items()}
+        if not self.cfg["cameras"]:     # réglages d'avant les caméras multiples : la source devient la 1re caméra
+            self.cfg["cameras"] = [{"id": "c1", "nom": "Mangeoire", "source": str(self.cfg["source"])}]
+            if self.cfg.get("camera_ip") and self.cfg["camera_ip"] != self.cfg["source"]:
+                self.cfg["cameras"].append({"id": "c2", "nom": "Caméra IP", "source": self.cfg["camera_ip"]})
+        if not self._camera(self.cfg["camera_courante"]):
+            self.cfg["camera_courante"] = self.cfg["cameras"][0]["id"]
+        self.cfg["source"] = self._camera()["source"]
+        self.surveillances = {}         # caméra -> Surveillance en cours
         self.messages = queue.Queue()
         self.verrou = threading.Lock()
-        self.derniere_image = None
+        self.derniere_image = {}        # caméra -> (image, etat) pas encore affichée
+        self.presence = {}              # caméra -> tortues à table
         self.image_affichee = None
         self.vignettes = {}
         self.vignettes_tortues = {}
         self.cache_vignettes = {}       # (chemin, taille, date du fichier) -> PhotoImage
+        self.verrou_corrections = threading.Lock()
+        self.jour_stats = datetime.now().date()
         self.fenetres_fiche = {}        # clé -> fenêtre de fiche ouverte
         self.diffusion = None           # fenêtre plein écran pour le stream (YouTube…)
         self.repas_du_jour = []         # [(nom, secondes)] des repas d'aujourd'hui, les plus longs d'abord
-        self.image_web = None           # dernière image pour le téléphone
+        self.image_web = {}             # caméra -> dernière image, pour le téléphone
         self.serveur_web = None
         self.alertes = None
         self.file_clips = queue.Queue()
@@ -127,8 +170,8 @@ class App:
         self.photo_visite = None
         self.modeles_prets = False
         self.fermeture = False
-        self.figee = False
-        self.relance_serie = 0          # numéro de la série d'essais de relance en cours
+        self.figee = {}                 # caméra -> image figée
+        self.relance_serie = {}         # caméra -> numéro de la série d'essais de relance en cours
         self.sauvegarde_en_cours = False
         self.detecteur = vision.DetecteurTortues()
         self.classeur = vision.ClasseurEspeces([e for e in vision.ESPECES_DEFAUT if e[1] in self.cfg["especes_actives"]])
@@ -143,7 +186,7 @@ class App:
         if "--demarrage" in sys.argv:            # lancé par le raccourci du dossier Démarrage
             self.root.after(500, self._demarrage_windows)
         elif self.cfg["demarrage_auto"]:
-            self.root.after(500, self.demarrer)
+            self.root.after(500, lambda: self.tout_demarrer(insister=True))
         self.root.after(15000, self._sauvegarde_auto)
         self._maj_alertes()
         threading.Thread(target=self._fil_clips, daemon=True).start()
@@ -151,31 +194,41 @@ class App:
             self.root.after(800, lambda: self._web(True, silencieux=True))
 
     def _demarrage_windows(self):
-        """Au démarrage de Windows : ouvre le programme prévu (EZVIZ Studio), attend sa fenêtre
-        jusqu'à 2 min, puis lance la surveillance. Sans fenêtre à attendre, démarre tout de suite."""
-        source = source_depuis_saisie(self.var_source.get())
+        """Au démarrage de Windows : ouvre le programme prévu (EZVIZ Studio) si une caméra filme une
+        fenêtre, attend chaque fenêtre jusqu'à 2 min, puis lance la surveillance de chaque caméra.
+        Une caméra IP ou une webcam démarre tout de suite (et attend elle-même sa caméra)."""
+        self._camera()["source"] = self._saisie_source()
+        titre = lambda c: c["source"][len(sources.PREFIXE_FENETRE):]
+        fenetres = [c for c in self.cfg["cameras"] if sources.est_fenetre(c["source"])]
         programme = self.cfg["lancer_avant"]
-        attendre = sources.est_fenetre(source)
-        if programme and attendre and not sources.trouver_fenetre(source[len(sources.PREFIXE_FENETRE):]):
+        if programme and fenetres and not all(sources.trouver_fenetre(titre(c)) for c in fenetres):
             try:
                 demarrage.lancer_programme(programme, self.cfg["sans_admin"])
             except OSError as e:
                 self.lbl_etat.configure(text=f"Impossible d'ouvrir {Path(programme).name} : {e}")
         fin = time.time() + 120
+        restantes = [c["id"] for c in self.cfg["cameras"]]
+
+        def lancer(ident):
+            if ident not in self.surveillances:     # l'utilisateur a pu cliquer sur Démarrer entre-temps
+                self.demarrer(ident, insister=True)
 
         def verifier():
-            if self.surveillance:
-                return
-            if not attendre or sources.trouver_fenetre(source[len(sources.PREFIXE_FENETRE):]):
-                # quelques secondes de plus : le lecteur doit encore afficher le direct
-                # revérifié au moment de démarrer : l'utilisateur a pu cliquer sur Démarrer entre-temps
-                self.root.after(15000 if attendre else 0, lambda: None if self.surveillance else self.demarrer())
-                self.lbl_etat.configure(text="Démarrage de la surveillance…")
-            elif time.time() < fin:
-                self.lbl_etat.configure(text=f"En attente de la fenêtre « {source[len(sources.PREFIXE_FENETRE):]} »…")
+            for ident in list(restantes):
+                c = self._camera(ident)
+                if c is None:
+                    restantes.remove(ident)
+                elif not sources.est_fenetre(c["source"]) or sources.trouver_fenetre(titre(c)):
+                    restantes.remove(ident)
+                    # une fenêtre trouvée : quelques secondes de plus, le lecteur doit encore afficher le direct
+                    self.root.after(15000 if sources.est_fenetre(c["source"]) else 0, lambda i=ident: lancer(i))
+            if restantes and time.time() < fin:
+                self.lbl_etat.configure(text="En attente de la fenêtre « " + titre(self._camera(restantes[0])) + " »…")
                 self.root.after(2000, verifier)
-            else:
+            elif restantes:
                 self.lbl_etat.configure(text="Fenêtre introuvable après 2 min : ouvrez-la puis cliquez sur Démarrer")
+            else:
+                self.lbl_etat.configure(text="Démarrage de la surveillance…")
 
         verifier()
 
@@ -304,12 +357,18 @@ class App:
         self.lbl_modele = tk.Label(tete, text="Modèles : chargement…", bg=FOND, fg=DISCRET, font=("Segoe UI", 10))
         self.lbl_modele.pack(side="right", padx=16)
 
-        barre = tk.Frame(r, bg=FOND)
-        barre.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 10))
+        cadre_barre = tk.Frame(r, bg=FOND)
+        cadre_barre.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 10))
+        self.barre_cameras = tk.Frame(cadre_barre, bg=FOND)
+        self.barre_cameras.pack(fill="x", pady=(0, 8))
+        barre = tk.Frame(cadre_barre, bg=FOND)
+        barre.pack(fill="x")
         tk.Label(barre, text="Caméra", bg=FOND, fg=DISCRET).pack(side="left")
         self.var_source = tk.StringVar(value=libelle_source(self.cfg["source"]))
-        self.cb_source = ttk.Combobox(barre, textvariable=self.var_source, values=[f"Webcam {i}" for i in range(4)], width=30)
+        self.cb_source = ttk.Combobox(barre, textvariable=self.var_source, width=30)
+        self._valeurs_sources()
         self.cb_source.pack(side="left", padx=(8, 4))
+        ttk.Button(barre, text="📷  Caméra IP", command=self.camera_ip).pack(side="left", padx=(0, 4))
         ttk.Button(barre, text="🪟  Fenêtre", command=self.choisir_fenetre).pack(side="left", padx=(0, 4))
         ttk.Button(barre, text="🎞  Vidéo", command=self._choisir_fichier).pack(side="left", padx=(0, 4))
         ttk.Button(barre, text="⛶  Cadrer", command=self.cadrer).pack(side="left", padx=(0, 12))
@@ -338,6 +397,8 @@ class App:
         self.video = tk.Label(cadre_video, bg="#070a06")
         self.video.pack(fill="both", expand=True)
         self.video.bind("<Configure>", lambda e: self._afficher_vide() if self.surveillance is None else None)
+        self.etat_pastilles = None
+        self._maj_cameras()
         self.zones_video = []
         for bouton in ("<Button-1>", "<Button-3>"):
             self.video.bind(bouton, self._menu_video)
@@ -420,6 +481,226 @@ class App:
         defil.pack(side="right", fill="y")
         return arbre
 
+    def _valeurs_sources(self):
+        valeurs = [f"Webcam {i}" for i in range(4)]
+        if self.cfg.get("camera_ip"):
+            valeurs.insert(0, libelle_source(self.cfg["camera_ip"]))
+        self.cb_source.configure(values=valeurs)
+
+    def _saisie_source(self):
+        return source_depuis_saisie(self.var_source.get(), self.cfg["source"], self.cfg.get("camera_ip", ""))
+
+    def camera_ip(self):
+        """Caméra Mercusys, Tapo ou autre RTSP : cherchée sur le Wi-Fi, testée, puis utilisée directement,
+        sans application à laisser ouverte."""
+        f = tk.Toplevel(self.root, bg=CARTE, padx=20, pady=16)
+        f.title("Caméra IP (Mercusys, Tapo…)")
+        f.transient(self.root)
+        actuelle = cameras.lire_adresse(self.cfg.get("camera_ip") or self.cfg["source"]) or ("", "", "", "stream1", 554)
+        standard = actuelle[3] in ("", "stream1", "stream2") and actuelle[4] == cameras.PORT_RTSP
+        v_marque = tk.StringVar(value=next(iter(cameras.MARQUES)) if standard else "Autre caméra RTSP")
+        v_port = tk.StringVar(value=str(actuelle[4]))
+        v_ip, v_id, v_mdp = tk.StringVar(value=actuelle[0]), tk.StringVar(value=actuelle[1]), tk.StringVar(value=actuelle[2])
+        v_qualite = tk.StringVar(value="Légère (stream2)" if actuelle[3] == "stream2" else "Haute qualité (stream1)")
+        v_chemin = tk.StringVar(value=actuelle[3] or "stream1")
+        ttk.Label(f, style="Discret.TLabel", justify="left", wraplength=560, text=(
+            "Dans l'appli Mercusys, créez d'abord le « compte de la caméra » (différent de votre compte Mercusys) :\n"
+            "Accueil → carte de la caméra → Paramètres de l'appareil → Paramètres avancés → Compte de la caméra.\n"
+            "Mettez aussi la qualité vidéo sur « Meilleure qualité ». Pour que l'adresse ne change pas, réservez-la "
+            "dans votre box (bail DHCP fixe).")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        def ligne(rang, texte, widget, apres=None):
+            ttk.Label(f, text=texte, style="Carte.TLabel").grid(row=rang, column=0, sticky="w", pady=5, padx=(0, 14))
+            widget.grid(row=rang, column=1, sticky="w")
+            if apres is not None:
+                apres.grid(row=rang, column=2, sticky="w", padx=(8, 0))
+
+        ligne(1, "Marque", ttk.Combobox(f, textvariable=v_marque, values=list(cameras.MARQUES), state="readonly", width=28))
+        trouvees = ttk.Combobox(f, textvariable=v_ip, width=28)
+        btn_chercher = ttk.Button(f, text="🔎  Chercher sur le Wi-Fi")
+        ligne(2, "Adresse IP de la caméra", trouvees, btn_chercher)
+        ligne(3, "Identifiant (compte de la caméra)", ttk.Entry(f, textvariable=v_id, width=30))
+        ligne(4, "Mot de passe", ttk.Entry(f, textvariable=v_mdp, width=30, show="•"))
+        qualite = ttk.Combobox(f, textvariable=v_qualite, values=("Haute qualité (stream1)", "Légère (stream2)"),
+                               state="readonly", width=28)
+        chemin = ttk.Entry(f, textvariable=v_chemin, width=30)
+        ligne(5, "Image", qualite)
+        lbl_chemin = ttk.Label(f, text="Chemin du flux et port", style="Carte.TLabel")
+        cadre_chemin = tk.Frame(f, bg=CARTE)
+        chemin.grid_forget()
+        chemin = ttk.Entry(cadre_chemin, textvariable=v_chemin, width=30)
+        chemin.pack(side="left")
+        ttk.Label(cadre_chemin, text="  port", style="Carte.TLabel").pack(side="left")
+        ttk.Entry(cadre_chemin, textvariable=v_port, width=6).pack(side="left", padx=(4, 0))
+        apercu = tk.Label(f, bg=FOND, width=60, height=12, text="Aperçu après « Tester »", fg=DISCRET)
+        apercu.grid(row=7, column=0, columnspan=3, pady=(12, 8))
+        statut = ttk.Label(f, style="Discret.TLabel", wraplength=560)
+        statut.grid(row=8, column=0, columnspan=3, sticky="w")
+
+        def maj_marque(*_):
+            autre = not cameras.MARQUES[v_marque.get()][0]
+            for w in (lbl_chemin, cadre_chemin):
+                w.grid_remove() if not autre else None
+            if autre:
+                lbl_chemin.grid(row=6, column=0, sticky="w", pady=5)
+                cadre_chemin.grid(row=6, column=1, sticky="w")
+        v_marque.trace_add("write", maj_marque)
+        maj_marque()
+
+        def url():
+            flux = cameras.MARQUES[v_marque.get()]
+            if flux[0]:
+                return cameras.adresse(v_ip.get(), v_id.get().strip(), v_mdp.get(),
+                                       flux[1] if "stream2" in v_qualite.get() else flux[0])
+            try:
+                port = int(v_port.get())
+            except ValueError:
+                raise ValueError("port illisible") from None
+            return cameras.adresse(v_ip.get(), v_id.get().strip(), v_mdp.get(), v_chemin.get(), port)
+
+        arret = threading.Event()               # fenêtre fermée : la recherche s'arrête
+        f.bind("<Destroy>", lambda e: arret.set() if e.widget is f else None)
+
+        def chercher():
+            btn_chercher.configure(state="disabled")
+            statut.configure(text="Recherche des caméras sur le réseau (une dizaine de secondes)…")
+            resultat = []
+
+            def travail():
+                try:
+                    liste = cameras.chercher(arret=arret)
+                    resultat.append((liste, cameras.appareils_tp_link({ip for ip, _o in liste})))
+                except Exception as e:          # carte réseau étrange : la fenêtre ne reste pas bloquée
+                    resultat.append(([], []))
+                    journaliser_erreur(e)
+            threading.Thread(target=travail, daemon=True).start()
+
+            def attendre():
+                if not f.winfo_exists():
+                    return
+                if not resultat:
+                    f.after(300, attendre)
+                    return
+                btn_chercher.configure(state="normal")
+                liste, fermees = resultat[0]
+                trouvees.configure(values=[ip for ip, _o in liste] + fermees)
+                if fermees and not liste:
+                    statut.configure(text=f"Aucune caméra au flux ouvert. Appareil(s) TP-Link sans flux vidéo : "
+                                          f"{', '.join(fermees)} (la caméra si son « compte de la caméra » n'est pas créé, "
+                                          "ou une prise, un répéteur…). Vérifiez l'adresse dans l'appli : Paramètres de "
+                                          "l'appareil → Infos de l'appareil.")
+                elif liste:
+                    v_ip.set(liste[0][0])
+                    tp = [ip for ip, o in liste if o]
+                    statut.configure(text=f"{len(liste)} caméra(s) trouvée(s)" +
+                                     (f" ; Mercusys ou Tapo probable : {', '.join(tp)}" if tp else ""))
+                else:
+                    statut.configure(text="Aucune caméra trouvée : vérifiez qu'elle est sur le même Wi-Fi, ou lisez son "
+                                          "adresse IP dans l'appli (Paramètres de l'appareil → Infos de l'appareil).")
+            f.after(300, attendre)
+
+        def tester():
+            try:
+                adresse = url()
+            except ValueError as e:
+                statut.configure(text=f"Impossible : {e}")
+                return
+            if self.surveillance:
+                statut.configure(text="Arrêtez d'abord la surveillance : la caméra n'accepte que peu de connexions à la fois.")
+                return
+            statut.configure(text="Connexion à la caméra…")
+            btn_tester.configure(state="disabled")
+            resultat = []
+
+            def travail():
+                try:
+                    ip, ident, mdp, voie, port = cameras.lire_adresse(adresse)
+                    if not any(cameras._ouvert(ip, port, 3.0) or time.sleep(1) for _ in range(3)):
+                        resultat.append("ferme")
+                        return
+                    acces = "muet"
+                    for _ in range(3):          # la caméra peut être occupée un instant (appli ouverte)
+                        acces = cameras.verifier_acces(ip, port, voie, ident, mdp)
+                        if acces != "muet":
+                            break
+                        time.sleep(1)
+                    if acces in ("refuse", "introuvable"):
+                        resultat.append(acces)
+                        return
+                    camera, image = sources.ouvrir_source(adresse)
+                    if camera is not None:
+                        camera.release()
+                    resultat.append(image)
+                except Exception as e:
+                    resultat.append(None)
+                    journaliser_erreur(e)
+            threading.Thread(target=travail, daemon=True).start()
+
+            def attendre():
+                if not f.winfo_exists():
+                    return
+                if not resultat:
+                    f.after(300, attendre)
+                    return
+                btn_tester.configure(state="normal")
+                image = resultat[0]
+                if image == "refuse":
+                    courriel = "@" in v_id.get()
+                    statut.configure(text=("La caméra refuse cet identifiant et ce mot de passe. " +
+                                           ("Une adresse e-mail est celle du compte Mercusys : il faut le « compte de la "
+                                            "caméra », créé à part dans l'appli (Paramètres avancés → Compte de la caméra). "
+                                            if courriel else "Utilisez ceux du « compte de la caméra » (Paramètres avancés → "
+                                            "Compte de la caméra dans l'appli), en respectant majuscules et minuscules. ")))
+                    return
+                if image == "introuvable":
+                    statut.configure(text="La caméra ne connaît pas ce chemin de flux : choisissez la marque Mercusys, "
+                                          "ou vérifiez le chemin (stream1 / stream2).")
+                    return
+                if isinstance(image, str):
+                    camera = cameras.lire_adresse(adresse)
+                    statut.configure(text=f"{camera[0]} ne répond pas sur le port vidéo ({camera[4]}) : le "
+                                          "« compte de la caméra » n'est pas encore créé, ou ce n'est pas l'adresse de la "
+                                          "caméra (vérifiez-la dans l'appli : Paramètres de l'appareil → Infos de l'appareil).")
+                    return
+                if image is None:
+                    statut.configure(text="Pas d'image : vérifiez l'adresse IP et le compte de la caméra (identifiant "
+                                          "et mot de passe créés dans l'appli, pas ceux du compte Mercusys).")
+                    return
+                h, w = image.shape[:2]
+                petite = cv2.resize(image, (480, int(480 * h / w)))
+                apercu.image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(petite, cv2.COLOR_BGR2RGB)))
+                apercu.configure(image=apercu.image, width=480, height=petite.shape[0])
+                statut.configure(text=f"Image reçue : {w}×{h}. Cliquez sur « Utiliser cette caméra ».")
+            f.after(300, attendre)
+
+        def utiliser():
+            try:
+                adresse = url()
+            except ValueError as e:
+                messagebox.showerror("Caméra IP", f"Impossible : {e}", parent=f)
+                return
+            if self.surveillance:
+                messagebox.showinfo("Caméra IP", "Arrêtez d'abord la surveillance.", parent=f)
+                return
+            ancienne = cle_source(self.cfg.get("camera_ip") or "")
+            if ancienne in self.cfg["zones"] and cle_source(adresse) not in self.cfg["zones"]:
+                self.cfg["zones"][cle_source(adresse)] = self.cfg["zones"][ancienne]   # même caméra, nouveau mot de passe
+            self.cfg["source"] = self.cfg["camera_ip"] = self._camera()["source"] = adresse
+            self._ecrire_config()
+            self._valeurs_sources()
+            self.var_source.set(libelle_source(adresse))
+            self.lbl_etat.configure(text=f"Caméra choisie : {libelle_source(adresse)}. Pensez à « Cadrer » si besoin.")
+            f.destroy()
+
+        btn_chercher.configure(command=chercher)
+        bas = tk.Frame(f, bg=CARTE)
+        bas.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        btn_tester = ttk.Button(bas, text="Tester", command=tester)
+        btn_tester.pack(side="left")
+        ttk.Button(bas, text="Utiliser cette caméra", style="Vert.TButton", command=utiliser).pack(side="right")
+        if not actuelle[0]:
+            chercher()
+
     def _choisir_fichier(self):
         chemin = filedialog.askopenfilename(title="Analyser une vidéo", filetypes=[("Vidéos", "*.mp4 *.avi *.mov *.mkv")])
         if chemin:
@@ -430,8 +711,7 @@ class App:
         self.cfg["reconnaissance"] = self.var_reco.get()
         self.cfg["creer_nouvelles"] = self.var_nouvelles.get()
         self.lbl_seuil.configure(text=f"{self.cfg['seuil']:.0%}")
-        s = self.surveillance
-        if s:
+        for s in list(getattr(self, "surveillances", {}).values()):
             s.seuil, s.reconnaissance_active, s.creer_nouvelles = (self.cfg["seuil"], self.cfg["reconnaissance"],
                                                                    self.cfg["creer_nouvelles"])
 
@@ -483,7 +763,7 @@ class App:
         lbl_point.grid(row=10, column=1, sticky="w")
 
         def apprendre():
-            source = source_depuis_saisie(self.var_source.get())
+            source = self._saisie_source()
             if not sources.est_fenetre(source):
                 messagebox.showinfo("Bouton de relance", "La source doit être une fenêtre (🪟 Fenêtre).", parent=f)
                 return
@@ -534,17 +814,26 @@ class App:
             try:
                 alerte, jours, go = int(v_alerte.get()), int(v_jours.get()), float(v_go.get())
                 rappel = int(v_pesee.get())
+                if not (0 <= alerte <= 3650 and 0 <= jours <= 3650 and 0 <= rappel <= 3650 and 0 <= go <= 100000):
+                    raise ValueError
             except ValueError:
-                messagebox.showerror("Réglages", "Les jours et la taille doivent être des nombres.", parent=f)
+                messagebox.showerror("Réglages", "Jours : de 0 à 3650. Taille : de 0 à 100000 Go (0 = sans limite).",
+                                     parent=f)
                 return
             actives = [s for s, c in coches.items() if c.get()]
             if len(actives) < 2:
                 messagebox.showerror("Réglages", "Cochez au moins deux espèces.", parent=f)
                 return
             nouveau_dossier = v_dossier.get() != self.cfg["dossier"]
-            if nouveau_dossier and self.surveillance:
+            if nouveau_dossier and self.surveillances:
                 messagebox.showerror("Réglages", "Arrêtez la surveillance avant de changer de dossier.", parent=f)
                 return
+            if nouveau_dossier:
+                for fenetre in list(self.fenetres_fiche.values()):
+                    if fenetre.winfo_exists() and hasattr(fenetre, "fermer"):
+                        fenetre.fermer()
+                        if fenetre.winfo_exists():     # « Annuler » : on reste sur l'ancien dossier
+                            return
             change = actives != self.cfg["especes_actives"]
             if v_relance.get() and not point[0]:
                 messagebox.showerror("Réglages", "Montrez d'abord le bouton de relance (📍).", parent=f)
@@ -586,41 +875,203 @@ class App:
         ttk.Button(f, text="Enregistrer", style="Vert.TButton", command=enregistrer).grid(row=15, column=1, columnspan=2, sticky="e", pady=(14, 0))
 
     # -------------------------------------------------------------- surveillance
+    @property
+    def surveillance(self):
+        """Surveillance de la caméra affichée (None si elle est arrêtée)."""
+        return self.surveillances.get(self.cfg["camera_courante"])
+
+    def _camera(self, ident=None):
+        ident = ident or self.cfg["camera_courante"]
+        return next((c for c in self.cfg["cameras"] if c["id"] == ident), None)
+
+    def _maj_cameras(self):
+        """Pastilles des caméras : vert = surveillée, rouge = tortue à table, ambre = image figée."""
+        etat = tuple((c["id"], c["nom"], c["id"] in self.surveillances, self.presence.get(c["id"], 0),
+                      bool(self.figee.get(c["id"])), c["id"] == self.cfg["camera_courante"]) for c in self.cfg["cameras"])
+        if etat == self.etat_pastilles:
+            return
+        self.etat_pastilles = etat
+        for w in self.barre_cameras.winfo_children():
+            w.destroy()
+        tk.Label(self.barre_cameras, text="Caméras", bg=FOND, fg=DISCRET).pack(side="left", padx=(0, 10))
+        for ident, nom, active, n, figee, courante in etat:
+            couleur = AMBRE if figee else ROUGE if n else VERT if active else DISCRET
+            texte = f"●  {nom}" + (f"   {n} 🐢" if n else "") + ("   figée" if figee else "" if active else "   arrêtée")
+            b = tk.Label(self.barre_cameras, text=texte, bg=BORD if courante else CARTE, fg=couleur,
+                         font=("Segoe UI Semibold", 10), padx=12, pady=5, cursor="hand2")
+            b.pack(side="left", padx=(0, 6))
+            b.bind("<Button-1>", lambda _e, i=ident: self.choisir_camera(i))
+            b.bind("<Button-3>", lambda e, i=ident: self._menu_camera(e, i))
+        plus = tk.Label(self.barre_cameras, text="＋  Caméra", bg=FOND, fg=VERT, font=("Segoe UI Semibold", 10),
+                        padx=8, pady=5, cursor="hand2")
+        plus.pack(side="left")
+        plus.bind("<Button-1>", lambda _e: self.ajouter_camera())
+        if len(etat) > 1:
+            toutes = any(not a for _i, _n, a, *_r in etat)
+            t = tk.Label(self.barre_cameras, text="▶▶  Démarrer toutes" if toutes else "■  Arrêter toutes", bg=FOND,
+                         fg=VERT if toutes else ROUGE, font=("Segoe UI Semibold", 10), padx=12, pady=5, cursor="hand2")
+            t.pack(side="left", padx=(12, 0))
+            t.bind("<Button-1>", lambda _e: self.tout_demarrer() if toutes else self.tout_arreter())
+        tk.Label(self.barre_cameras, text="clic droit sur une caméra : la renommer ou la retirer", bg=FOND, fg=DISCRET,
+                 font=("Segoe UI", 9)).pack(side="right")
+        if hasattr(self, "btn_demarrer"):
+            en_cours = self.surveillance is not None
+            if str(self.btn_demarrer.cget("state")) != "disabled" or not en_cours:
+                self.btn_demarrer.configure(text="■  Arrêter" if en_cours else "▶  Démarrer",
+                                            style="Rouge.TButton" if en_cours else "Vert.TButton", state="normal")
+
+    def choisir_camera(self, ident):
+        """Affiche une autre caméra ; la source tapée pour l'ancienne (arrêtée) lui reste."""
+        if ident == self.cfg["camera_courante"] or not self._camera(ident):
+            return
+        if self.surveillance is None:
+            self._camera()["source"] = self._saisie_source()
+        self.cfg["camera_courante"] = ident
+        self.cfg["source"] = self._camera()["source"]
+        self._ecrire_config()
+        self._valeurs_sources()
+        self.var_source.set(libelle_source(self.cfg["source"]))
+        self.image_affichee = None
+        self._maj_cameras()
+        if self.surveillance is None:
+            self._afficher_vide()
+            self.pastille.configure(text="●  En veille", fg=DISCRET)
+
+    def ajouter_camera(self):
+        nom = self._demander_nom("Nouvelle caméra", f"Caméra {len(self.cfg['cameras']) + 1}")
+        if not nom:
+            return
+        ident = f"c{int(time.time() * 1000):x}"
+        self.cfg["cameras"].append({"id": ident, "nom": nom, "source": "0"})
+        self.choisir_camera(ident)
+        self.lbl_etat.configure(text=f"« {nom} » ajoutée : choisissez sa source (📷 Caméra IP, 🪟 Fenêtre…), puis Démarrer")
+
+    def _demander_nom(self, titre, nom=""):
+        f = tk.Toplevel(self.root, bg=CARTE, padx=20, pady=16)
+        f.title(titre)
+        f.transient(self.root)
+        f.grab_set()
+        v = tk.StringVar(value=nom)
+        resultat = []
+        ttk.Label(f, text="Nom (ex. Mangeoire, Abri, Bassin)", style="Carte.TLabel").grid(row=0, column=0, sticky="w")
+        e = ttk.Entry(f, textvariable=v, width=30)
+        e.grid(row=1, column=0, pady=(4, 10))
+        e.focus_set()
+        e.select_range(0, "end")
+
+        def valider(_=None):
+            if v.get().strip():
+                resultat.append(v.get().strip()[:40])
+                f.destroy()
+
+        f.bind("<Return>", valider)
+        ttk.Button(f, text="Valider", style="Vert.TButton", command=valider).grid(row=2, column=0, sticky="e")
+        self.root.wait_window(f)
+        return resultat[0] if resultat else None
+
+    def _menu_camera(self, ev, ident):
+        cam = self._camera(ident)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"{cam['nom']} — {libelle_source(cam['source'])}", state="disabled")
+        menu.add_command(label="Renommer…", command=lambda: self._renommer_camera(ident))
+        etat = "normal" if len(self.cfg["cameras"]) > 1 and ident not in self.surveillances else "disabled"
+        menu.add_command(label="Retirer cette caméra…", command=lambda: self._retirer_camera(ident), state=etat)
+        menu.tk_popup(ev.x_root, ev.y_root)
+
+    def _renommer_camera(self, ident):
+        cam = self._camera(ident)
+        nom = self._demander_nom("Renommer la caméra", cam["nom"])
+        if nom:
+            cam["nom"] = nom
+            if ident in self.surveillances:
+                self.surveillances[ident].camera = nom
+            self._ecrire_config()
+            self._maj_cameras()
+
+    def _retirer_camera(self, ident):
+        cam = self._camera(ident)
+        if ident in self.surveillances or len(self.cfg["cameras"]) < 2:
+            return
+        if messagebox.askyesno("Caméras", f"Retirer la caméra « {cam['nom']} » ? Ses visites restent au journal."):
+            self.cfg["cameras"] = [c for c in self.cfg["cameras"] if c["id"] != ident]
+            if ident == self.cfg["camera_courante"]:
+                self.cfg["camera_courante"] = ""
+                self.choisir_camera(self.cfg["cameras"][0]["id"])
+            self._ecrire_config()
+            self.etat_pastilles = None
+            self._maj_cameras()
+
+    def tout_demarrer(self, insister=False):
+        if self.surveillance is None:
+            self._camera()["source"] = self._saisie_source()
+        for c in list(self.cfg["cameras"]):
+            if c["id"] not in self.surveillances:
+                self.demarrer(c["id"], insister)
+
+    def tout_arreter(self):
+        for ident in list(self.surveillances):
+            self.arreter(ident)
+
     def basculer(self):
         self.arreter() if self.surveillance else self.demarrer()
 
-    def demarrer(self):
-        source = source_depuis_saisie(self.var_source.get())
-        self.cfg["source"] = source
+    def demarrer(self, ident=None, insister=False):
+        ident = ident or self.cfg["camera_courante"]
+        cam = self._camera(ident)
+        if cam is None or ident in self.surveillances:
+            return
+        if ident == self.cfg["camera_courante"]:
+            cam["source"] = self._saisie_source()
+            self.cfg["source"] = cam["source"]
+        source = cam["source"]
+        if any(c["source"] == source and c["id"] in self.surveillances for c in self.cfg["cameras"]):
+            self.lbl_etat.configure(text=f"Cette source est déjà surveillée par une autre caméra : {libelle_source(source)}")
+            return
         self._ecrire_config()
-        self.surveillance = Surveillance(
+        s = Surveillance(
             source, self.dossier, registre=self.registre, detecteur=self.detecteur, classeur=self.classeur,
             seuil=self.cfg["seuil"], marge=MARGE_INDIVIDU, reconnaissance=self.cfg["reconnaissance"],
             creer_nouvelles=self.cfg["creer_nouvelles"], menage_jours=self.cfg["menage_jours"],
-            menage_go=self.cfg["menage_go"], temps_reel=True, zone=self.cfg["zones"].get(source),
-            sur_image=self._sur_image, sur_visite=lambda l: self.messages.put(("visite", l)),
-            sur_message=lambda m: self.messages.put(("message", m)),
-            sur_figee=lambda f: self.messages.put(("figee", f)))
-        self.btn_demarrer.configure(text="■  Arrêter", style="Rouge.TButton")
-        threading.Thread(target=self._executer, args=(self.surveillance,), daemon=True).start()
+            menage_go=self.cfg["menage_go"], temps_reel=True, zone=self.cfg["zones"].get(cle_source(source)),
+            sur_image=lambda image, etat, i=ident: self._sur_image(i, image, etat),
+            sur_visite=lambda l: self.messages.put(("visite", l)),
+            sur_message=lambda m, nom=cam["nom"]: self.messages.put(("message", f"{nom} : {m}" if len(self.cfg["cameras"]) > 1 else m)),
+            sur_figee=lambda f, i=ident: self.messages.put(("figee", (i, f))))
+        s.insister = insister
+        s.camera, s.camera_id = cam["nom"], ident
+        self.surveillances[ident] = s
+        threading.Thread(target=self._executer, args=(s, ident), daemon=True).start()
+        self._maj_cameras()
 
-    def _executer(self, surveillance):
+    def _executer(self, surveillance, ident):
         try:
             ok = surveillance.executer()
         except Exception as e:
             self.messages.put(("message", f"Erreur : {type(e).__name__} : {e}"))
             ok = False
-        self.messages.put(("fin", ok))
+        self.messages.put(("fin", (ident, ok)))
 
-    def arreter(self):
-        if self.surveillance:
-            self.btn_demarrer.configure(state="disabled", text="Arrêt…")
-            self.surveillance.arreter()
+    def arreter(self, ident=None):
+        ident = ident or self.cfg["camera_courante"]
+        s = self.surveillances.get(ident)
+        if s:
+            if ident == self.cfg["camera_courante"]:
+                self.btn_demarrer.configure(state="disabled", text="Arrêt…")
+            s.arreter()
 
-    def _sur_image(self, image, etat):
+    def _sur_image(self, ident, image, etat):
         with self.verrou:
-            self.derniere_image = (image, etat)
-        self.image_web = (image, etat)          # lue par le serveur du téléphone, sans la consommer
+            self.derniere_image[ident] = (image, etat)
+            self.image_web[ident] = (image, etat)      # lue par le serveur du téléphone, sans la consommer
+            self.presence[ident] = etat["presence"]
+
+    def _image_web(self):
+        """Image du téléphone : la caméra affichée si elle tourne, sinon une autre qui tourne."""
+        with self.verrou:
+            for ident in [self.cfg["camera_courante"]] + list(self.surveillances):
+                if ident in self.surveillances and ident in self.image_web:
+                    return self.image_web[ident]
+        return None
 
     def _boucle(self):
         if self.fermeture and not self._tk_vivant():
@@ -629,17 +1080,24 @@ class App:
             self._quitter_diffusion()           # fermée par Alt+F4 : retour à l'affichage normal
         try:
             self._traiter_messages()
+            if not self._tk_vivant():       # fenêtre détruite pendant les messages (fin de surveillance en quittant)
+                return
+            if datetime.now().date() != self.jour_stats:
+                self.jour_stats = datetime.now().date()
+                self._maj_stats()           # minuit : « aujourd'hui » repart de zéro, au direct aussi
             with self.verrou:
-                donnees, self.derniere_image = self.derniere_image, None
+                donnees = self.derniere_image.pop(self.cfg["camera_courante"], None)
+                n = sum(v for k, v in self.presence.items() if k in self.surveillances)
             if donnees and self.surveillance:
                 image, etat = donnees
                 if self.diffusion is not None:      # plein écran : la fenêtre principale est cachée dessous
                     self._afficher_diffusion(image, etat)
                 else:
                     self._afficher_image(image, etat)
-                n = etat["presence"]
+            if self.surveillances:                  # toutes caméras confondues
                 self.pastille.configure(text=f"●  {n} tortue{'s' if n > 1 else ''} à table" if n else "●  Surveillance",
                                         fg=ROUGE if n else VERT)
+            self._maj_cameras()
         except Exception as e:      # une erreur d'affichage ne doit pas figer l'interface pour la session
             journaliser_erreur(e)
             self.lbl_etat.configure(text=f"Erreur d'affichage : {type(e).__name__}")
@@ -667,14 +1125,14 @@ class App:
             elif genre == "tortues":
                 self._maj_tortues()
             elif genre == "figee":
-                self.figee = contenu
-                self.relance_serie += 1          # une seule série d'essais à la fois
-                if contenu:
+                ident, figee = contenu
+                self.figee[ident] = figee
+                self.relance_serie[ident] = serie = self.relance_serie.get(ident, 0) + 1   # une série à la fois
+                if figee:
                     self.root.bell()
-                    serie = self.relance_serie
-                    self.root.after(3000, lambda: self._relancer_direct(1, serie))
+                    self.root.after(3000, lambda i=ident, s_=serie: self._relancer_direct(1, s_, i))
                     # toujours figée 5 min plus tard (relance ratée) : prévenir le téléphone
-                    self.root.after(300000, lambda: self._alerte_figee(serie))
+                    self.root.after(300000, lambda i=ident, s_=serie: self._alerte_figee(s_, i))
             elif genre == "sauvegarde":
                 self.lbl_etat.configure(text=contenu)
             elif genre == "visite":
@@ -689,23 +1147,35 @@ class App:
             elif genre == "cadrage":
                 self._fenetre_cadrage(*contenu)
             elif genre == "fin":
+                ident, contenu = contenu
+                self.surveillances.pop(ident, None)
                 if self.fermeture:
-                    self.root.destroy()
-                    return
+                    if not self.surveillances:  # chaque caméra a fini son clip et sa dernière visite
+                        self.root.destroy()
+                        return
+                    continue
+                cam = self._camera(ident) or {"nom": ""}
                 if not contenu and self.alertes:
-                    self.alertes.en_fond(self.alertes.signaler, f"arret:{time.time():.0f}",
+                    self.alertes.en_fond(self.alertes.signaler, f"arret:{ident}:{time.time():.0f}",
+                                         f"Surveillance arrêtée : {cam['nom']}" if len(self.cfg["cameras"]) > 1 else
                                          "Surveillance arrêtée",
                                          # texte fixe : le message d'erreur peut contenir chemins et nom d'utilisateur
                                          "La surveillance s'est arrêtée sur une erreur : voir le PC.", 4,
                                          ("warning", "video_camera"))
                 if not contenu and self.diffusion is None:     # pas de boîte d'erreur en plein direct
                     messagebox.showerror("Source vidéo", self.lbl_etat.cget("text"))
-                self.surveillance, self.derniere_image, self.image_web = None, None, None
-                self.figee = False               # la prochaine surveillance repart d'une image vivante
-                self.relance_serie += 1
-                self.btn_demarrer.configure(text="▶  Démarrer", style="Vert.TButton", state="normal")
-                self.pastille.configure(text="●  En veille", fg=DISCRET)
-                self._afficher_vide()
+                with self.verrou:
+                    self.derniere_image.pop(ident, None)
+                    self.image_web.pop(ident, None)
+                    self.presence.pop(ident, None)
+                self.figee[ident] = False        # la prochaine surveillance repart d'une image vivante
+                self.relance_serie[ident] = self.relance_serie.get(ident, 0) + 1
+                if ident == self.cfg["camera_courante"]:
+                    self.btn_demarrer.configure(text="▶  Démarrer", style="Vert.TButton", state="normal")
+                    self._afficher_vide()
+                if not self.surveillances:
+                    self.pastille.configure(text="●  En veille", fg=DISCRET)
+                self._maj_cameras()
 
     # -------------------------------------------------------------- sources
     def choisir_fenetre(self):
@@ -733,13 +1203,13 @@ class App:
         if self.surveillance:
             messagebox.showinfo("Cadrer", "Arrêtez d'abord la surveillance.")
             return
-        source = sources.source_depuis_texte(source_depuis_saisie(self.var_source.get()))
+        source = sources.source_depuis_texte(self._saisie_source())
 
         def travail():
             camera, image = sources.ouvrir_source(source)
             if camera is not None:
                 camera.release()
-                self.messages.put(("cadrage", (str(source), image)))
+                self.messages.put(("cadrage", (cle_source(source), image)))
             else:
                 self.messages.put(("message", f"Aucune image de : {sources.masquer(source)}"))
 
@@ -869,7 +1339,7 @@ class App:
             for port in [prefere] + [p for p in range(web.PORT, web.PORT + 10) if p != prefere]:
                 try:
                     self.serveur_web = web.Serveur(self.registre, lambda: self.dossier,
-                                                   lambda: self.image_web if self.surveillance else None,
+                                                   self._image_web,
                                                    self.cfg["web_code"], port=port, secret=self.cfg["web_secret"],
                                                    apres_modif=lambda: self.messages.put(("tortues", None))).demarrer()
                     self.cfg["web_port"] = port
@@ -880,6 +1350,8 @@ class App:
                 if not silencieux:
                     messagebox.showerror("Téléphone", f"Accès impossible : les ports {web.PORT} à {web.PORT + 9} sont pris.")
                 self.lbl_etat.configure(text="Accès téléphone impossible : ports occupés")
+                if silencieux:              # au démarrage : le réglage reste, on réessaiera au prochain lancement
+                    return False
                 actif = False
         self.cfg["web_actif"] = actif
         self._ecrire_config()
@@ -1185,6 +1657,11 @@ class App:
             self._ajouter_visite(l, True)
         if lignes:
             self._afficher_visite(lignes[-1])
+        else:
+            self.visite_affichee = self.photo_visite = None
+            self.lbl_photo.configure(image="")
+            self.lbl_individu.configure(text="—", foreground=DISCRET)
+            self.lbl_details.configure(text="Aucune visite pour l'instant")
         self._maj_stats()
         self._maj_tortues()
 
@@ -1233,6 +1710,8 @@ class App:
         origine = {"manuel": "  ·  corrigée à la main", "nouvelle": "  ·  nouvelle tortue"}.get(ligne.get("source"), "")
         fiche = self.registre.fiches.get(ligne.get("id_individu"))
         identite = fiches.resume_identite(fiche) if fiche else ligne["espece"]
+        if ligne.get("camera") and len(self.cfg["cameras"]) > 1:
+            origine += f"  ·  {ligne['camera']}"
         self.lbl_details.configure(text=f"{identite}\n{quand}  ·  {duree_lisible(secondes(ligne))}{origine}"
                                         + ("  ·  clic : sa fiche" if fiche else ""))
 
@@ -1259,7 +1738,7 @@ class App:
         if ligne.get("id_individu") in self.registre.fiches:
             menu.add_command(label=f"🐢  Fiche de {ligne['individu']}…", command=lambda: self.fiche_tortue(ligne["id_individu"]))
             menu.add_separator()
-        if ligne.get("id_proposition") in self.registre.fiches:
+        if self.registre.resoudre(ligne.get("id_proposition") or "") in self.registre.fiches:
             menu.add_command(label=f"✔  Oui, c'est {ligne['proposition']}", command=lambda: self._corriger(ligne, ligne["id_proposition"]))
             menu.add_separator()
         menu.add_command(label="Cette visite est de :", state="disabled")
@@ -1321,9 +1800,13 @@ class App:
             self._corriger(ligne, PAS_UNE_TORTUE)
 
     def _corriger(self, ligne, cle):
+        if cle != PAS_UNE_TORTUE:
+            cle = self.registre.resoudre(cle) or cle    # tortue fusionnée entre-temps : celle qui l'a absorbée
+
         def travail():
             try:
-                corrigee = corriger_visite(self.dossier, self.registre, ligne["id_visite"], cle)
+                with self.verrou_corrections:   # une à la fois : deux corrections rapides ne mêlent pas les galeries
+                    corrigee = corriger_visite(self.dossier, self.registre, ligne["id_visite"], cle)
                 if corrigee is None:
                     self.messages.put(("corrige", "Cette visite n'est plus au journal"))
                 elif corrigee["sans_image"]:
@@ -1344,10 +1827,13 @@ class App:
 
     def _maj_stats(self):
         aujourd_hui = datetime.now().strftime("%Y-%m-%d")
-        temps = defaultdict(float)
+        temps, noms = defaultdict(float), {}
         for l in self.lignes.values():
             if l["date"] == aujourd_hui:
-                temps[l["individu"]] += secondes(l)
+                qui = l.get("id_individu") or l["individu"]     # deux tortues du même nom restent deux
+                temps[qui] += secondes(l)
+                fiche = self.registre.fiches.get(l.get("id_individu"))
+                noms[qui] = fiche["nom"] if fiche else l["individu"]
         c = self.stats
         c.delete("all")
         largeur = max(c.winfo_width(), 360)
@@ -1356,7 +1842,7 @@ class App:
             c.configure(height=30)
             c.create_text(0, 14, anchor="w", text="Pas encore de repas aujourd'hui", fill=DISCRET, font=("Segoe UI", 10))
             return
-        top = sorted(temps.items(), key=lambda x: -x[1])[:5]
+        top = [(noms[q], s) for q, s in sorted(temps.items(), key=lambda x: -x[1])[:5]]
         self.repas_du_jour = [(n, s) for n, s in top if n != INCONNUE]
         c.configure(height=26 * len(top))
         maxi = top[0][1] or 1
@@ -1480,21 +1966,15 @@ class App:
         menu.add_command(label="Supprimer la fiche…", command=lambda: self._supprimer(cle))
         menu.tk_popup(evenement.x_root, evenement.y_root)
 
-    def _modifier_tortue(self, cle):
-        fiche = self.registre.fiches[cle]
-        resultat = self._dialogue_tortue("Fiche de la tortue", fiche["nom"], fiche["espece"])
-        if resultat:
-            nom, espece = resultat
-            if self._journal_libre(renommer_dans_journal, self.dossier, cle, nom, espece):
-                self.registre.modifier(cle, nom=nom, espece=espece, provisoire=False)
-            self.charger_historique()
-
     def _fusionner(self, source, cible):
         fs, fc = self.registre.fiches[source], self.registre.fiches[cible]
         if messagebox.askyesno("Même tortue", f"« {fs['nom']} » et « {fc['nom']} » sont la même tortue ?\n"
                                               f"Tout est regroupé sous « {fc['nom']} »."):
             self._journal_puis(lambda: renommer_dans_journal(self.dossier, source, fc["nom"], fc["espece"], cible),
                                lambda: self.registre.fusionner(source, cible))
+            ouverte = self.fenetres_fiche.get(cible)
+            if ouverte is not None and ouverte.winfo_exists() and hasattr(ouverte, "remplir"):
+                ouverte.remplir()               # sinon « Enregistrer » écraserait ce que la fusion a apporté
             self.charger_historique()
 
     def _supprimer(self, cle):
@@ -1683,7 +2163,7 @@ class App:
             details.configure(text=f"{ligne['date'][8:]}/{ligne['date'][5:7]} à {ligne['heure'][:5]}  ·  "
                                    f"{duree_lisible(secondes(ligne))}  ·  {ligne['espece']}")
             fiches = sorted(self.registre.copie_fiches().items(), key=lambda x: (x[1].get("provisoire", False), x[1]["nom"]))
-            proposee = ligne.get("id_proposition") if ligne.get("id_proposition") in self.registre.fiches else None
+            proposee = self.registre.resoudre(ligne.get("id_proposition") or "")
             if proposee:
                 ttk.Button(choix, text=f"✔  Oui, c'est {self.registre.fiches[proposee]['nom']}   (Entrée)", style="Vert.TButton",
                            command=lambda: repondre(proposee)).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
@@ -1734,7 +2214,10 @@ class App:
         positions = lire_positions(self.dossier)
         photos = sorted(self.dossier.glob("*_photo.jpg"))
         try:
-            fond_zones = Image.open(photos[-1]) if photos else None
+            fond_zones = None
+            if photos:
+                with Image.open(photos[-1]) as img:     # copiée en mémoire : le fichier reste libre
+                    fond_zones = img.copy()
         except OSError:
             fond_zones = None
         for titre in ("Rythme", "Réseau social", "Dominance", "Déplacements", "Santé"):
@@ -1863,13 +2346,14 @@ class App:
         remplir()
 
     # -------------------------------------------------------------- relance du direct, sauvegarde
-    def _relancer_direct(self, essai, serie):
+    def _relancer_direct(self, essai, serie, ident):
         """Image figée : clic sur le bouton du lecteur appris dans les Réglages. 5 essais,
         espacés de 90 s, tant que l'image reste figée. Une série s'arrête dès qu'une autre
         commence (nouvel état figé ou revenu, surveillance arrêtée)."""
-        source = str(self.cfg["source"])
-        if not (serie == self.relance_serie and self.figee and self.surveillance and self.cfg["relance_auto"]
-                and self.cfg["relance_point"] and sources.est_fenetre(source)):
+        cam = self._camera(ident)
+        source = str(cam["source"]) if cam else ""
+        if not (cam and serie == self.relance_serie.get(ident) and self.figee.get(ident) and ident in self.surveillances
+                and self.cfg["relance_auto"] and self.cfg["relance_point"] and sources.est_fenetre(source)):
             return
         try:
             sources.cliquer(source[len(sources.PREFIXE_FENETRE):], self.cfg["relance_point"])
@@ -1881,7 +2365,7 @@ class App:
         except OSError as e:
             self.lbl_etat.configure(text=f"Relance impossible : {e}")
         if essai < 5:
-            self.root.after(90000, lambda: self._relancer_direct(essai + 1, serie))
+            self.root.after(90000, lambda: self._relancer_direct(essai + 1, serie, ident))
 
     def _sauvegarde_maintenant(self):
         """Sauvegarde du jour, si elle manque, dans un fil : copier les galeries prend quelques secondes.
@@ -1925,9 +2409,11 @@ class App:
                 self.messages.put(("message", f"{len(envoyees)} alerte(s) envoyée(s) au téléphone"))
         threading.Thread(target=travail, daemon=True).start()
 
-    def _alerte_figee(self, serie):
-        if self.alertes and self.figee and serie == self.relance_serie and self.surveillance:
-            self.alertes.en_fond(self.alertes.signaler, f"figee:{int(time.time() // 1800)}", "Image figée",
+    def _alerte_figee(self, serie, ident):
+        if self.alertes and self.figee.get(ident) and serie == self.relance_serie.get(ident) and ident in self.surveillances:
+            nom = (self._camera(ident) or {}).get("nom", "")
+            self.alertes.en_fond(self.alertes.signaler, f"figee:{ident}:{int(time.time() // 1800)}",
+                                 f"Image figée : {nom}" if len(self.cfg["cameras"]) > 1 else "Image figée",
                                  "Le direct ne bouge plus depuis 5 minutes et la relance n'a pas marché. "
                                  "Relancez le lecteur vidéo sur le PC.", 4, ("warning", "video_camera"))
 
@@ -1938,11 +2424,12 @@ class App:
         while True:
             ligne, auto, essais = self.file_clips.get()
             source = self.dossier / ligne["video"]
-            s = self.surveillance
-            en_cours = (s is not None and getattr(s, "video", None) is not None and getattr(s, "chemin_clip", None)
-                        and Path(s.chemin_clip).name == source.name)
+            en_cours = any(getattr(s, "video", None) is not None and getattr(s, "chemin_clip", None)
+                           and Path(s.chemin_clip).name == source.name for s in list(self.surveillances.values()))
             if not source.exists() and not en_cours:          # vidéo effacée : inutile d'attendre
-                if not auto:
+                if auto:
+                    self.dernier_clip.pop(ligne.get("id_individu"), None)
+                else:
                     self.messages.put(("message", "Clip impossible : la vidéo de cette visite n'existe plus"))
                 continue
             if en_cours and essais < 90:
@@ -1973,7 +2460,9 @@ class App:
                     self.messages.put(("message", "Clip impossible : visite trop courte ou vidéo illisible"))
             except Exception as e:          # un clip raté ne doit pas arrêter le fil
                 journaliser_erreur(e)
-                if not auto:
+                if auto:
+                    self.dernier_clip.pop(ligne.get("id_individu"), None)
+                else:
                     self.messages.put(("message", f"Clip impossible : {type(e).__name__}"))
 
     def _demander_clip(self, ligne):
@@ -2158,10 +2647,19 @@ class App:
                 return False
             renomme = (valeurs["nom"], valeurs["espece"]) != (fi["nom"], fi["espece"])
             if renomme:
-                if not self._journal_libre(renommer_dans_journal, self.dossier, cle, valeurs["nom"], valeurs["espece"]):
-                    return False
                 valeurs["provisoire"] = False
-            self.registre.modifier(cle, **valeurs)
+                erreur = None
+                with VERROU_JOURNAL:            # aucune visite ne s'écrit entre le journal et la fiche
+                    try:
+                        renommer_dans_journal(self.dossier, cle, valeurs["nom"], valeurs["espece"])
+                        self.registre.modifier(cle, **valeurs)
+                    except JournalOccupe as e:
+                        erreur = e
+                if erreur:
+                    messagebox.showerror("Journal", str(erreur), parent=f)
+                    return False
+            else:
+                self.registre.modifier(cle, **valeurs)
             notes.edit_modified(False)
             bandeau()
             if renomme:
@@ -2373,11 +2871,16 @@ class App:
                 choix = messagebox.askyesnocancel("Fiche", "Enregistrer les modifications de l'identité ?", parent=f)
                 if choix is None or (choix and not enregistrer()):
                     return
+            commencee = v_texte.get().strip() or getattr(cadre_poids, "v_poids", tk.StringVar()).get().strip()
+            if cle in self.registre.fiches and commencee and not messagebox.askyesno(
+                    "Fiche", "Une note ou une pesée est tapée mais pas ajoutée. Fermer quand même ?", parent=f):
+                return
             self.fenetres_fiche.pop(cle, None)
             f.destroy()
 
         f.protocol("WM_DELETE_WINDOW", fermer)
         f.fermer = fermer                       # appelé aussi en quittant Broutille
+        f.remplir = lambda: (remplir(), aide_dates(), bandeau(), carnet())
         f.bind("<Escape>", lambda _e: fermer())
         onglets.bind("<<NotebookTabChanged>>",
                      lambda _e: photos() if onglets.index("current") == 2 else None)
@@ -2403,6 +2906,7 @@ class App:
         saisie.pack(fill="x")
         v_date = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
         v_poids, v_note = tk.StringVar(), tk.StringVar()
+        f.v_poids = v_poids                     # la fiche vérifie à la fermeture qu'aucune pesée n'est en suspens
         for col, (texte, var, larg) in enumerate((("Date", v_date, 12), ("Poids (g)", v_poids, 10), ("Remarque", v_note, 30))):
             ttk.Label(saisie, text=texte, style="Carte.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 10))
             e = ttk.Entry(saisie, textvariable=var, width=larg)
@@ -2516,14 +3020,15 @@ class App:
         if self.serveur_web:
             self.serveur_web.arreter()
             self.serveur_web = None
-        if not self.surveillance:
+        if not self.surveillances:
             self.root.destroy()
             return
-        # la fenêtre attend la fin de la surveillance : sinon le clip en cours serait illisible
-        # et la visite perdue. Filet d'une minute si la source ne répond plus.
+        # la fenêtre attend la fin de chaque surveillance : sinon le clip en cours serait illisible
+        # et la visite perdue. Filet d'une minute si une source ne répond plus.
         self.fermeture = True
         self.root.withdraw()
-        self.surveillance.arreter()
+        for s in list(self.surveillances.values()):
+            s.arreter()
         self.root.after(60000, self.root.destroy)
 
 

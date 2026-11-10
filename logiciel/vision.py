@@ -109,7 +109,7 @@ class DetecteurTortues:
         image = Image.fromarray(cv2.cvtColor(petite, cv2.COLOR_BGR2RGB))
         entrees = self.processeur(images=image, text=self.texte, return_tensors="pt",
                                   size={"shortest_edge": self.cote, "longest_edge": int(self.cote * 1.34)}).to(self.appareil)
-        with torch.no_grad():
+        with self._verrou, torch.no_grad():       # plusieurs caméras partagent le modèle : une image à la fois
             sorties = self.modele(**entrees)
         r = self.processeur.post_process_grounded_object_detection(
             sorties, entrees["input_ids"], threshold=self.seuil, text_threshold=self.seuil,
@@ -264,7 +264,7 @@ class Descripteur:
         self.charger()
         vue = cv2.cvtColor(tortue_bgr, cv2.COLOR_BGR2RGB)[None]
         x = torch.from_numpy(vue).permute(0, 3, 1, 2).float().div(255).sub(0.5).div(0.5).to(self.appareil)
-        with torch.no_grad():
+        with self._verrou, torch.no_grad():
             f = self.modele(x)
         f = f / f.norm(dim=-1, keepdim=True)
         return f.cpu().numpy()

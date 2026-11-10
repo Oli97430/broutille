@@ -42,7 +42,7 @@ import vision
 from sources import est_fichier, masquer, ouvrir_source, source_depuis_texte
 
 COLONNES = ["id_visite", "date", "heure", "duree_s", "individu", "espece", "confiance", "video", "photo", "source",
-            "corrige", "id_individu", "proposition", "id_proposition"]
+            "corrige", "id_individu", "proposition", "id_proposition", "camera"]
 INCONNUE = "Inconnue"
 PAS_UNE_TORTUE = "Pas une tortue"
 MAX_EXEMPLES = 60               # photos gardées par individu
@@ -140,6 +140,25 @@ def _lire_attente(dossier):
     return lignes
 
 
+def _date_iso(texte):
+    """Excel réenregistre « 2026-11-08 » en « 08/11/2026 » : on revient à l'ISO."""
+    t = texte.strip()
+    if "/" in t:
+        try:
+            return datetime.strptime(t.split(" ")[0], "%d/%m/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+    return t
+
+
+def _heure_iso(texte):
+    t = texte.strip()
+    morceaux = t.split(":")
+    if 2 <= len(morceaux) <= 3 and all(m.isdigit() for m in morceaux):
+        return ":".join(f"{int(m):02d}" for m in (morceaux + ["0"])[:3])
+    return t
+
+
 def _lire_csv(chemin):
     """Lignes de visites.csv. Tolère un enregistrement par Excel (autre encodage) et une ligne coupée
     par une panne : un journal abîmé ne doit jamais empêcher l'application de s'ouvrir."""
@@ -156,6 +175,7 @@ def _lire_csv(chemin):
     for l in csv.DictReader(textes, delimiter=";", restval=""):
         l.pop(None, None)               # champs en trop (Excel, ancienne version) : ignorés, la ligne reste
         # ligne coupée par une panne : date incomplète ou nom absent. Excel, lui, n'ôte que des champs de fin vides.
+        l["date"], l["heure"] = _date_iso(l.get("date") or ""), _heure_iso(l.get("heure") or "")
         if not l.get("id_visite") or len(l.get("date") or "") != 10 or not l.get("heure") or not l.get("individu"):
             continue
         lignes.append({c: (v if v is not None else "") for c, v in l.items()})
@@ -163,9 +183,19 @@ def _lire_csv(chemin):
 
 
 def assurer_journal(chemin):
+    """Crée le journal, ou met son en-tête à jour (colonne ajoutée par une version plus récente) :
+    sinon les champs nouveaux seraient écrits sous un en-tête qui ne les connaît pas, et perdus."""
     with VERROU_JOURNAL:
         if not chemin.exists():
             ecrire_journal(chemin, [])
+            return
+        try:
+            with open(chemin, encoding="utf-8-sig", errors="replace") as f:
+                entete = f.readline().strip().split(";")
+        except OSError:
+            return
+        if entete != COLONNES:
+            ecrire_journal(chemin, _lire_csv(chemin))
 
 
 def ecrire_journal(chemin, lignes):
@@ -192,8 +222,27 @@ def modifier_journal(dossier, modification):
         lignes = lire_journal(dossier)
         resultat = modification(lignes)
         ecrire_journal(Path(dossier) / "visites.csv", lignes)
-        _attente(dossier).unlink(missing_ok=True)
+        try:
+            _insister(lambda: _attente(dossier).unlink(missing_ok=True))
+        except JournalOccupe:
+            _attente(dossier).write_text("", encoding="utf-8")
         return resultat
+
+
+def _finir_ligne(chemin):
+    """Une coupure de courant peut laisser une dernière ligne sans fin : la suivante s'y collerait."""
+    try:
+        with open(chemin, "rb") as f:
+            f.seek(0, 2)
+            if f.tell() == 0:
+                return
+            f.seek(-1, 2)
+            if f.read(1) == b"\n":
+                return
+        with open(chemin, "ab") as f:
+            f.write(b"\r\n")
+    except FileNotFoundError:
+        pass
 
 
 def ajouter_ligne(dossier, ligne):
@@ -206,16 +255,21 @@ def ajouter_ligne(dossier, ligne):
         en_attente = _lire_attente(dossier)
         try:
             assurer_journal(chemin)
+            _insister(lambda: _finir_ligne(chemin))
             with open(chemin, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=COLONNES, delimiter=";", extrasaction="ignore")
                 for l in en_attente + [ligne]:
                     w.writerow({c: (l.get(c) or "") for c in COLONNES})
-            _attente(dossier).unlink(missing_ok=True)
-            return True
         except (PermissionError, JournalOccupe):
             with open(_attente(dossier), "a", encoding="utf-8") as f:
                 f.write(json.dumps(ligne, ensure_ascii=False) + "\n")
             return False
+        # écrites : le fichier d'attente doit disparaître, sinon elles seraient réécrites en double
+        try:
+            _insister(lambda: _attente(dossier).unlink(missing_ok=True))
+        except JournalOccupe:
+            _attente(dossier).write_text("", encoding="utf-8")
+        return True
 
 
 def secondes(ligne):
@@ -230,6 +284,11 @@ ENTETE_POSITIONS = "id_visite;t_s;x;y;l;h;image_l;image_h\n"
 
 
 def ecrire_positions(dossier, id_visite, piste):
+    with VERROU_JOURNAL:            # plusieurs caméras : un ajout à la fois dans le fichier du mois
+        _ecrire_positions(dossier, id_visite, piste)
+
+
+def _ecrire_positions(dossier, id_visite, piste):
     """Ajoute le trajet d'une visite à positions/AAAA-MM.csv : une ligne par analyse, le temps en
     secondes depuis l'arrivée, le cadre en pixels. Relié au journal par id_visite : une visite
     corrigée change de tortue sans rien réécrire ici."""
@@ -240,6 +299,8 @@ def ecrire_positions(dossier, id_visite, piste):
     chemin = d / f"{piste.arrivee:%Y-%m}.csv"
     nouveau = not chemin.exists()
     il, ih = piste.taille_image
+    if not nouveau:
+        _finir_ligne(chemin)
     with open(chemin, "a", encoding="utf-8", newline="") as f:
         if nouveau:
             f.write(ENTETE_POSITIONS)
@@ -274,6 +335,7 @@ def nettoyer(dossier, jours=60, max_go=20.0, garder=()):
     dossier dépasse `max_go`. 0 = pas de limite. Le journal et les galeries sont conservés, ainsi que
     les fichiers de `garder` (clip en cours). Renvoie le nombre de clips effacés."""
     dossier = Path(dossier)
+    jours, max_go = max(0, jours or 0), max(0.0, max_go or 0.0)    # négatif : tout effacer ; jamais
     fichiers = sorted((p for p in dossier.glob("*.*") if p.suffix in (".mp4", ".jpg") and p.name not in garder),
                       key=lambda p: p.name)
     supprimes = 0
@@ -714,7 +776,10 @@ class Piste:
         Piste.numero += 1
         self.numero = Piste.numero
         self.boite, self.debut, self.vue = boite, instant, instant
-        self.arrivee = datetime.now()
+        # datée de l'image (pas de la fin de l'analyse, plusieurs secondes plus tard sur processeur) ;
+        # vidéo enregistrée : son instant n'est pas une heure, on garde l'heure de l'analyse
+        self.arrivee = datetime.now() - timedelta(seconds=max(0.0, time.time() - instant)) \
+            if instant > 1e9 else datetime.now()
         self.analyses = 0
         self.p_tortue = []
         self.especes = defaultdict(float)
@@ -884,6 +949,9 @@ class Surveillance:
                  sur_image=None, sur_visite=None, sur_message=None, temps_reel=False, menage_jours=60, menage_go=20.0,
                  sur_figee=None):
         self.source = source_depuis_texte(source)
+        self.insister = False           # True : attendre la source sans fin (démarrage automatique)
+        self.camera = ""                # nom de la caméra, noté dans le journal (plusieurs caméras)
+        self.camera_id = ""             # ajouté au nom des clips : deux caméras peuvent en ouvrir un à la même seconde
         self.dossier = Path(dossier)
         self.registre = registre or Registre(self.dossier)
         self.detecteur = detecteur or vision.DetecteurTortues()
@@ -944,7 +1012,8 @@ class Surveillance:
         # nommé d'après sa première image (le tampon d'avant l'arrivée) : le nom donne le vrai début,
         # dont se servent les clips verticaux pour retrouver l'arrivée de chaque tortue
         avance = max(0.0, instant - tampon[0][0]) if tampon else 0.0
-        base = self.dossier / (datetime.now() - timedelta(seconds=avance)).strftime("%Y-%m-%d_%H-%M-%S")
+        base = self.dossier / ((datetime.now() - timedelta(seconds=avance)).strftime("%Y-%m-%d_%H-%M-%S")
+                               + (f"_{self.camera_id}" if self.camera_id else ""))
         chemin, n = base.with_suffix(".mp4"), 1
         while chemin.exists():
             n += 1
@@ -969,12 +1038,15 @@ class Surveillance:
         """Fin de visite confiée au fil des tâches ; son clip est protégé du ménage jusqu'à ce que
         la ligne du journal soit écrite."""
         if piste.clip:
-            self._clips_en_attente[piste.clip] += 1
+            with self._verrou:
+                self._clips_en_attente[piste.clip] += 1
         self._tache(self._terminer_piste, piste)
 
     def _nettoyer_clip(self, nom):
         """Fausse alerte : aucune visite ne cite ce clip, et aucune tortue encore là."""
-        if not nom or (self.video is not None and self.chemin_clip.name == nom) or self._clips_en_attente[nom] > 0:
+        with self._verrou:
+            attendu = self._clips_en_attente[nom] > 0
+        if not nom or (self.video is not None and self.chemin_clip.name == nom) or attendu:
             return
         with self._verrou:
             if any(p.clip == nom for p in self.pistes):
@@ -1002,6 +1074,8 @@ class Surveillance:
                 piste = Piste(fiches[i][1], instant)
                 self.pistes.append(piste)
                 paires.append((piste, i))
+            for piste, _i in paires:    # vue maintenant : la boucle ne doit pas la terminer pendant l'analyse
+                piste.vue = max(piste.vue, instant)
         for piste, i in paires:
             _score, boite, p_tortue, classes = fiches[i]
             piste.boite, piste.vue = boite, instant
@@ -1112,7 +1186,9 @@ class Surveillance:
             return self._terminer_piste_(piste)
         finally:
             if piste.clip:
-                self._clips_en_attente[piste.clip] -= 1
+                with self._verrou:
+                    self._clips_en_attente[piste.clip] -= 1
+                self._nettoyer_clip(piste.clip)     # fausse alerte : le clip part s'il n'est plus cité
 
     def _terminer_piste_(self, piste):
         """Écrit la ligne du journal d'une tortue partie ; renvoie la ligne, ou None si fausse alerte.
@@ -1125,7 +1201,6 @@ class Surveillance:
             r.rejeter([(f"{base}_{i}.jpg", cv2.imencode(".jpg", e[1])[1].tobytes())
                        for i, e in enumerate(piste.exemples) if e[6]])
         if (duree < self.presence_min and piste.nommee is None) or not piste.confirmee():   # bout de tortue, pierre
-            self._nettoyer_clip(piste.clip)
             return None
         espece = piste.espece()
         cle, score = piste.verdict()
@@ -1170,7 +1245,6 @@ class Surveillance:
             self.sur_message(f"Positions non écrites : {e}")
         self.sur_message(f"Fin de visite : {ligne['individu']} ({ligne['espece']}), {duree:.0f} s")
         self.sur_visite(ligne)
-        self._nettoyer_clip(piste.clip)
         return ligne
 
     def _ligne_visite(self, piste, cle, espece, score, source, manuelle, base_visite, photo, duree):
@@ -1181,7 +1255,7 @@ class Surveillance:
                  "espece": fiche["espece"] if fiche else espece, "confiance": f"{min(score, 1):.2f}",
                  "video": piste.clip or "", "photo": photo, "source": source, "corrige": "1" if manuelle else "",
                  "id_individu": cle or "",
-                 "proposition": "", "id_proposition": ""}
+                 "proposition": "", "id_proposition": "", "camera": self.camera}
         probable = piste.probable()
         probable = r.resoudre(probable) if probable else None
         fiche_probable = r.copie_fiches().get(probable) if probable else None
@@ -1239,7 +1313,9 @@ class Surveillance:
                 camera, image = ouvrir_source(self.source)
                 ouverte = camera is not None
             else:
-                self._lancer_lecteur()
+                # démarrage sans personne devant (Windows, réglage) : la caméra peut encore s'allumer,
+                # le Wi-Fi se connecter ; on l'attend au lieu d'abandonner au premier échec
+                self._lancer_lecteur(insister=self.insister)
                 while not self.lecteur.pret.wait(0.5) and not self.arret.is_set():
                     pass
                 ouverte = self.lecteur.pret.is_set() and not self.lecteur.echec
@@ -1351,9 +1427,11 @@ class Surveillance:
 
                 # sur processeur, une analyse lente ne doit pas couper une visite en deux
                 delai = max(self.apres, 3 * self.duree_analyse)
-                for piste in [p for p in presentes if instant - p.vue > delai]:
-                    with self._verrou:
+                with self._verrou:          # revérifié sous le verrou : l'analyse a pu la revoir
+                    parties = [p for p in self.pistes if instant - p.vue > delai]
+                    for piste in parties:
                         self.pistes.remove(piste)
+                for piste in parties:
                     self._planifier_fin(piste)
 
                 if time.time() - t_menage > 600:

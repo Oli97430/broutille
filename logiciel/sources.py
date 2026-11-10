@@ -22,7 +22,8 @@ import numpy as np
 PREFIXE_FENETRE = "fenetre:"
 IMAGES_PAR_SECONDE_FENETRE = 10
 # RTSP en TCP : en UDP, les caméras Wi-Fi perdent des paquets et l'image se déchire
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;10000000")
+# « stimeout » n'existe plus depuis FFmpeg 5 : « timeout » (µs) borne l'attente d'une caméra muette
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|timeout;8000000")
 
 
 def source_depuis_texte(texte):
@@ -42,21 +43,33 @@ def est_fichier(source):
     return isinstance(source, str) and not est_flux(source) and not est_fenetre(source) and Path(source).is_file()
 
 
+CLES_SECRETES = ('pwd', 'pass', 'passwd', 'password', 'mdp', 'token', 'key', 'access_token', 'auth', 'apikey',
+                 'api_key', 'secret', 'sig', 'signature')
+
+
 def masquer(source):
     """Adresse sans son mot de passe : elle s'affiche à l'écran et dans les messages."""
     if not est_flux(source):
         return str(source)
+    source = str(source)
+    schema, sep, reste = source.partition("://")
+    if sep and "@" in reste:
+        # identifiants : tout ce qui précède le dernier « @ » (un mot de passe peut contenir # ? / @ non
+        # encodés). Mais un « @ » dans le chemin (youtube.com/@chaine) n'en est pas un : avant lui, des
+        # identifiants n'ont pas de « / », sauf un mot de passe (après « : ») qui en contiendrait
+        hote_fin = reste.rfind("@")
+        identifiants, apres = reste[:hote_fin], reste[hote_fin + 1:]
+        if "/" not in identifiants or ":" in identifiants.split("/")[0]:
+            utilisateur = identifiants.split(":", 1)[0] if ":" in identifiants else ""
+            source = f"{schema}://{utilisateur + ':' if utilisateur else ''}•••@{apres}"
     try:
         u = urllib.parse.urlsplit(source)
-        mot = u.password
     except ValueError:                  # adresse malformée : on ne montre rien de risqué
         return source.split("?", 1)[0].split("@")[-1]
-    if mot:
-        source = source.replace(f":{mot}@", ":•••@")
     if u.query:                         # caméras IP : ?user=admin&pwd=…
         morceaux = []
         for k, v in urllib.parse.parse_qsl(u.query, keep_blank_values=True):
-            morceaux.append(f"{k}={'•••' if k.lower() in ('pwd', 'pass', 'passwd', 'password', 'mdp', 'token', 'key') else v}")
+            morceaux.append(f"{k}={'•••' if k.lower() in CLES_SECRETES else v}")
         source = source.split("?", 1)[0] + "?" + "&".join(morceaux)
     return source
 
@@ -595,7 +608,11 @@ def ouvrir_source(source, largeur=1920, hauteur=1080):
         camera.calibrer()
     elif isinstance(source, str):
         adresse = resoudre_flux(source) if est_flux(source) else source
-        camera = cv2.VideoCapture(adresse, cv2.CAP_FFMPEG) if est_flux(source) else cv2.VideoCapture(adresse)
+        if est_flux(source):            # 8 s pour ouvrir, 10 s sans image : une caméra éteinte ne bloque pas 30 s
+            camera = cv2.VideoCapture(adresse, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000,
+                                                                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000])
+        else:
+            camera = cv2.VideoCapture(adresse)
     else:
         for api in (cv2.CAP_MSMF, cv2.CAP_DSHOW):
             camera = cv2.VideoCapture(source, api)
