@@ -119,23 +119,54 @@ def adresse(ip, identifiant, mot_de_passe, chemin="stream1", port=PORT_RTSP):
     return f"rtsp://{cred}{ip}:{int(port)}/{chemin}"
 
 
+def _requete(ip, port, demande, delai):
+    with socket.create_connection((ip, int(port)), timeout=delai) as s:
+        s.settimeout(delai)
+        s.sendall(demande.encode("utf-8"))
+        return s.recv(2048).decode("ascii", "replace")
+
+
+def _code(reponse):
+    morceaux = reponse.split(" ", 2)
+    return morceaux[1] if reponse.startswith("RTSP/") and len(morceaux) > 1 else ""
+
+
 def verifier_acces(ip, port, chemin, identifiant, mot_de_passe, delai=5.0):
-    """Demande le flux à la caméra (RTSP DESCRIBE, identification Basic qu'elle propose) : "ok", "refuse"
-    (identifiant ou mot de passe faux), "introuvable" (mauvais chemin), "muet" (pas de réponse)."""
-    import base64
-    cle = base64.b64encode(f"{identifiant}:{mot_de_passe}".encode("utf-8")).decode("ascii")
+    """Demande le flux à la caméra (RTSP DESCRIBE) : "ok", "refuse" (identifiant ou mot de passe faux),
+    "introuvable" (mauvais chemin), "muet" (pas de réponse).
+
+    Rien n'est envoyé d'office : on demande d'abord sans identifiants, puis on répond au défi Digest
+    de la caméra (le mot de passe ne circule jamais, seulement une empreinte liée à ce défi). Basic,
+    qui l'envoie lisible, n'est utilisé que si l'appareil ne propose rien d'autre."""
+    import hashlib
+    import re
     chemin = chemin.lstrip("/")
+    url = f"rtsp://{ip}:{int(port)}/{chemin}"
+    base = f"DESCRIBE {url} RTSP/1.0\r\nCSeq: {{}}\r\nAccept: application/sdp\r\n"
     try:
-        with socket.create_connection((ip, int(port)), timeout=delai) as s:
-            s.settimeout(delai)
-            demande = (f"DESCRIBE rtsp://{ip}:{int(port)}/{chemin} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n"
-                       f"Authorization: Basic {cle}\r\n\r\n")
-            s.sendall(demande.encode("utf-8"))
-            reponse = s.recv(200).decode("ascii", "replace")
+        reponse = _requete(ip, port, base.format(2) + "\r\n", delai)
+        if _code(reponse) != "401":
+            return {"200": "ok", "404": "introuvable"}.get(_code(reponse), "muet")
+        defis = re.findall(r"WWW-Authenticate:\s*(\w+)\s*(.*)", reponse, re.IGNORECASE)
+        digest = next((p for nom, p in defis if nom.lower() == "digest"), None)
+        if digest is not None:
+            champs = dict(re.findall(r'(\w+)="([^"]*)"', digest))
+            royaume, nonce = champs.get("realm", ""), champs.get("nonce", "")
+            ha1 = hashlib.md5(f"{identifiant}:{royaume}:{mot_de_passe}".encode("utf-8")).hexdigest()
+            ha2 = hashlib.md5(f"DESCRIBE:{url}".encode("utf-8")).hexdigest()
+            rep = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode("utf-8")).hexdigest()
+            entete = (f'Authorization: Digest username="{identifiant}", realm="{royaume}", nonce="{nonce}", '
+                      f'uri="{url}", response="{rep}"\r\n')
+        elif any(nom.lower() == "basic" for nom, _p in defis):
+            import base64
+            cle = base64.b64encode(f"{identifiant}:{mot_de_passe}".encode("utf-8")).decode("ascii")
+            entete = f"Authorization: Basic {cle}\r\n"
+        else:
+            return "muet"
+        reponse = _requete(ip, port, base.format(3) + entete + "\r\n", delai)
     except OSError:
         return "muet"
-    code = reponse.split(" ", 2)[1] if reponse.startswith("RTSP/") and len(reponse.split(" ")) > 1 else ""
-    return {"200": "ok", "401": "refuse", "403": "refuse", "404": "introuvable"}.get(code, "muet")
+    return {"200": "ok", "401": "refuse", "403": "refuse", "404": "introuvable"}.get(_code(reponse), "muet")
 
 
 def lire_adresse(source):

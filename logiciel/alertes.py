@@ -20,6 +20,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import rapports
+from i18n import t, tn
 
 SERVEUR = "https://ntfy.sh"
 FICHIER = "alertes.json"
@@ -42,7 +43,7 @@ def envoyer(serveur, sujet, titre, message, priorite=3, etiquettes=("turtle",), 
                                  headers={"Content-Type": "application/json", "User-Agent": "Broutille"})
     with urllib.request.urlopen(req, timeout=delai) as rep:
         if rep.status >= 300:
-            raise OSError(f"ntfy : réponse {rep.status}")
+            raise OSError(t("ntfy : réponse {code}", code=rep.status))
 
 
 def a_envoyer(fiches, journal, aujourd_hui=None, jours_absence=3):
@@ -62,17 +63,18 @@ def a_envoyer(fiches, journal, aujourd_hui=None, jours_absence=3):
         vue = derniere.get(cle)
         if jours_absence and vue and vue < limite:
             jours = (aujourd_hui - date.fromisoformat(vue)).days
-            sortie.append((f"absence:{cle}:{vue}", f"{f['nom']} ne vient plus manger",
-                           f"Pas vue à la mangeoire depuis {jours} jours (dernière visite le "
-                           f"{vue[8:10]}/{vue[5:7]}).", 4, ("turtle", "warning")))
+            sortie.append((f"absence:{cle}:{vue}", t("{nom} ne vient plus manger", nom=f["nom"]),
+                           tn("Pas vue à la mangeoire depuis {n} jour (dernière visite le {date}).",
+                              "Pas vue à la mangeoire depuis {n} jours (dernière visite le {date}).", jours,
+                              date=t("{jour}/{mois}", jour=vue[8:10], mois=vue[5:7])), 4, ("turtle", "warning")))
         b = rapports.bilan_poids(f.get("pesees", []), aujourd_hui)
         if b and b["alerte"]:
             pire = min((e for e in (b["precedente"], b["mois"]) if e), key=lambda e: e["pct"])
-            depuis = f"{pire['date'][8:10]}/{pire['date'][5:7]}"
-            sortie.append((f"poids:{cle}:{b['dernier']['date']}", f"{f['nom']} perd du poids",
-                           f"Dernier poids : {rapports.poids_lisible(b['dernier']['g'])}, "
-                           f"{rapports.ecart_lisible(pire)} depuis le {depuis}. À surveiller.", 4,
-                           ("turtle", "scales")))
+            depuis = t("{jour}/{mois}", jour=pire["date"][8:10], mois=pire["date"][5:7])
+            sortie.append((f"poids:{cle}:{b['dernier']['date']}", t("{nom} perd du poids", nom=f["nom"]),
+                           t("Dernier poids : {poids}, {ecart} depuis le {date}. À surveiller.",
+                             poids=rapports.poids_lisible(b["dernier"]["g"]), ecart=rapports.ecart_lisible(pire),
+                             date=depuis), 4, ("turtle", "scales")))
     return sortie
 
 
@@ -109,7 +111,7 @@ class Alertes:
             try:
                 self.envoi(self.serveur, self.sujet, titre, message, priorite, etiquettes)
             except OSError as e:
-                self.sur_erreur(f"Alerte non envoyée : {e}")
+                self.sur_erreur(t("Alerte non envoyée : {erreur}", erreur=e))
                 return False
             deja[sujet_alerte] = episode
             self._retenir(deja)

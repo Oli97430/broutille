@@ -12,6 +12,7 @@ from datetime import date
 from pathlib import Path
 
 from broutille_cam import VERROU_JOURNAL
+from i18n import t
 
 GARDER = 7
 FICHIERS = ("visites.csv", "visites_en_attente.jsonl", "registre.json", "registre.bak")
@@ -34,7 +35,7 @@ def sauvegarder(dossier, destination, jour=None, garder=GARDER):
     OSError si la destination est absente (clé USB débranchée) ou pleine."""
     dossier, destination = Path(dossier), Path(destination)
     if not destination.is_dir():
-        raise OSError(f"dossier de sauvegarde introuvable : {destination}")
+        raise OSError(t("dossier de sauvegarde introuvable : {dossier}", dossier=destination))
     final = destination / nom_archive(jour)
     if final.exists():
         return None
@@ -81,5 +82,5 @@ def restaurer(archive, dossier):
     with zipfile.ZipFile(archive) as z:
         for membre in z.namelist():
             if membre.startswith("/") or ".." in Path(membre).parts:
-                raise ValueError(f"archive suspecte : {membre}")
+                raise ValueError(t("archive suspecte : {fichier}", fichier=membre))
         z.extractall(dossier)

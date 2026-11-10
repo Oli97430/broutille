@@ -33,6 +33,17 @@ ESPECES_DEFAUT = [
     ("Tortue des steppes", "Testudo horsfieldii", "Russian Tortoise"),
     ("Tortue étoilée", "Geochelone elegans", "Indian Star Tortoise"),
 ]
+# Les noms français ci-dessus sont des clés (stockées dans les fiches et le journal) : on les traduit à
+# l'affichage, par t(nom).
+
+
+def _cles_a_traduire():
+    """Jamais appelée : signale à tests/cles_i18n.py les noms d'espèces, traduits à l'affichage par
+    t(nom). Rien n'est traduit à l'import (la langue n'est pas encore choisie)."""
+    from i18n import t
+    return (t("Tortue radiée"), t("Tortue sillonnée"), t("Tortue d'Aldabra"), t("Tortue léopard"),
+            t("Tortue charbonnière"), t("Tortue d'Hermann"), t("Tortue grecque"), t("Tortue des steppes"),
+            t("Tortue étoilée"))
 AUTRES = ["a photo of a human hand.", "a photo of a person.", "a photo of a dog.", "a photo of a cat.",
           "a photo of a chicken.", "a photo of a rat.", "a photo of a lizard.", "a photo of a bird.",
           "a photo of grass and leaves.", "a photo of a rock.", "a photo of vegetables on a tray.",

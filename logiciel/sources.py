@@ -19,6 +19,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from i18n import t
+
 PREFIXE_FENETRE = "fenetre:"
 IMAGES_PAR_SECONDE_FENETRE = 10
 # RTSP en TCP : en UDP, les caméras Wi-Fi perdent des paquets et l'image se déchire
@@ -159,10 +161,10 @@ def lister_fenetres():
 
 def trouver_fenetre(titre):
     titre = titre.lower()
-    for t, hwnd in lister_fenetres():
-        if t.lower() == titre:
+    for nom, hwnd in lister_fenetres():
+        if nom.lower() == titre:
             return hwnd
-    return next((hwnd for t, hwnd in lister_fenetres() if titre in t.lower()), None)
+    return next((hwnd for nom, hwnd in lister_fenetres() if titre in nom.lower()), None)
 
 
 # ------------------------------------------------------------------
@@ -190,7 +192,7 @@ def cliquer(titre, point, double=True):
     point). DroitsInsuffisants si Windows le refuse ; OSError si la fenêtre a disparu."""
     hwnd = trouver_fenetre(titre)
     if not hwnd:
-        raise OSError(f"fenêtre introuvable : {titre}")
+        raise OSError(t("fenêtre introuvable : {titre}", titre=titre))
     x0, y0, l, h = _client(hwnd)
     ecran = wt.POINT(int(x0 + point[0] * l), int(y0 + point[1] * h))
     # sous-fenêtre la plus profonde sous le point : c'est elle qui reçoit les clics
@@ -213,8 +215,8 @@ def cliquer(titre, point, double=True):
         ctypes.set_last_error(0)
         if not user32.PostMessageW(cible, m, MK_LBUTTON if m in (WM_LBUTTONDOWN, WM_LBUTTONDBLCLK) else 0, coords):
             if ctypes.get_last_error() == 5:
-                raise DroitsInsuffisants("clic refusé par Windows : le programme tourne en administrateur")
-            raise OSError("clic impossible")
+                raise DroitsInsuffisants(t("clic refusé par Windows : le programme tourne en administrateur"))
+            raise OSError(t("clic impossible"))
         time.sleep(0.05)
     return True
 

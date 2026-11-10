@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from i18n import t
+
 ICI = Path(__file__).resolve().parent
 NOM_RACCOURCI = "Broutille.lnk"
 # raccourci d'EZVIZ Studio créé par son installateur, s'il existe
@@ -42,7 +44,7 @@ def _powershell(script, **env):
                        capture_output=True, text=True, timeout=30, encoding="oem", errors="replace",
                        env={**os.environ, **env}, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if r.returncode != 0:
-        raise OSError(r.stderr.strip() or "raccourci impossible")
+        raise OSError(r.stderr.strip() or t("raccourci impossible"))
 
 
 def est_active():
@@ -62,10 +64,11 @@ def activer(cible=None):
         "$s.Arguments = '\"' + $env:BR_SCRIPT + '\" --demarrage';"
         "$s.WorkingDirectory = $env:BR_DOSSIER;"
         "$s.IconLocation = $env:BR_ICONE;"
-        "$s.Description = 'Broutille : surveillance de la mangeoire';"
+        "$s.Description = $env:BR_DESCRIPTION;"
         "$s.Save()",
         BR_LIEN=str(lien), BR_CIBLE=str(_pythonw()), BR_SCRIPT=str(ICI / "broutille_app.py"),
-        BR_DOSSIER=str(ICI), BR_ICONE=str(ICI / "broutille.ico"))
+        BR_DOSSIER=str(ICI), BR_ICONE=str(ICI / "broutille.ico"),
+        BR_DESCRIPTION=t("Broutille : surveillance de la mangeoire"))
     return lien
 
 

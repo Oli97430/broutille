@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 
 from PIL import Image, ImageDraw
 
+from i18n import nombre, t, tn
 from rapports import AMBRE, ENCRE, FILET, GRIS, VERT, police
 
 DEPLACEMENT_S = 60       # partie moins d'une minute après l'arrivée de l'autre : déplacée
@@ -59,12 +60,12 @@ def rythme(liste):
     heures qu'elle couvre (une visite de 12 h 50 à 13 h 10 compte pour les deux heures)."""
     r = defaultdict(lambda: [0.0] * 24)
     for cle, debut, fin in liste:
-        t = debut
-        while t < fin:
-            prochaine = (t + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        instant = debut
+        while instant < fin:
+            prochaine = (instant + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
             bout = min(fin, prochaine)
-            r[cle][t.hour] += (bout - t).total_seconds() / 60
-            t = bout
+            r[cle][instant.hour] += (bout - instant).total_seconds() / 60
+            instant = bout
     return dict(r)
 
 
@@ -86,7 +87,7 @@ def regularite(liste):
 
 def heure_lisible(h):
     m = round(h * 60)
-    return f"{m // 60 % 24:02d} h {m % 60:02d}"
+    return t("{h} h {min}", h=f"{m // 60 % 24:02d}", min=f"{m % 60:02d}")
 
 
 # ------------------------------------------------------------------ réseau social
@@ -175,14 +176,17 @@ def sante(liste, fin=None, semaine=SEMAINE, reference=30):
         alertes = []
         if par_jour_ref and (fin - p["premiere"]).days >= 3:
             if par_jour_sem < 0.5 * par_jour_ref:
-                alertes.append(f"mange deux fois moins ({par_jour_sem:.0f} min/j contre {par_jour_ref:.0f})")
+                alertes.append(t("mange deux fois moins ({semaine} min/j contre {avant})",
+                                 semaine=nombre(par_jour_sem, 0), avant=nombre(par_jour_ref, 0)))
             if absente >= 3 and assidue:
-                alertes.append(f"pas venue depuis {absente} jours")
+                alertes.append(tn("pas venue depuis {n} jour", "pas venue depuis {n} jours", absente))
             if p["arrivees_sem"] and p["arrivees_ref"]:
                 decalage = (sum(p["arrivees_sem"]) / len(p["arrivees_sem"])
                             - sum(p["arrivees_ref"]) / len(p["arrivees_ref"]))
                 if abs(decalage) >= 2:
-                    alertes.append(f"arrive {abs(decalage):.0f} h plus {'tard' if decalage > 0 else 'tôt'}")
+                    ecart = nombre(abs(decalage), 0)
+                    alertes.append(t("arrive {h} h plus tard", h=ecart) if decalage > 0
+                                   else t("arrive {h} h plus tôt", h=ecart))
         res[cle] = {"semaine_min_j": par_jour_sem, "ref_min_j": par_jour_ref, "absente_j": absente,
                     "alertes": alertes}
     return res
@@ -200,7 +204,7 @@ def image_rythme(r, noms_, taille=(980, 60), fond=(255, 255, 255), encre=ENCRE, 
     d = ImageDraw.Draw(img)
     case = (l - gauche - 10) / 24
     for heure in range(0, 24, 2):
-        d.text((gauche + heure * case + case / 2, 6), f"{heure}h", font=f, fill=discret, anchor="ma")
+        d.text((gauche + heure * case + case / 2, 6), t("{h}h", h=heure), font=f, fill=discret, anchor="ma")
     for i, cle in enumerate(cles):
         y = haut + i * ligne
         d.text((gauche - 10, y + ligne / 2), noms_.get(cle, cle)[:18], font=f, fill=encre, anchor="rm")
@@ -222,7 +226,7 @@ def image_reseau(reseau, totaux, noms_, taille=(620, 520), fond=(255, 255, 255),
     f = police(14)
     cles = sorted(totaux, key=lambda c: -totaux[c])
     if not cles:
-        d.text((l / 2, h / 2), "Pas encore de visites nommées", font=police(18), fill=discret, anchor="mm")
+        d.text((l / 2, h / 2), t("Pas encore de visites nommées"), font=police(18), fill=discret, anchor="mm")
         return img
     cx, cy, rayon = l / 2, h / 2, min(l, h) / 2 - 70
     pos = {c: (cx + rayon * math.cos(2 * math.pi * i / len(cles) - math.pi / 2),

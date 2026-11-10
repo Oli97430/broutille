@@ -15,7 +15,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+
+from i18n import police_pil, t
 
 LARGEUR, HAUTEUR = 1080, 1920
 DUREE_MAX = 25.0
@@ -26,12 +28,12 @@ ZOOM = 0.7                  # le cadre prend 70 % de la hauteur : de la marge po
 
 
 def _police(taille, gras=False):
-    for nom in (["seguisb.ttf", "segoeuib.ttf"] if gras else ["segoeui.ttf"]):
-        try:
-            return ImageFont.truetype(nom, taille)
-        except OSError:
-            pass
-    return ImageFont.load_default()
+    return police_pil(taille, gras)
+
+
+def _aujourd_hui():
+    n = datetime.now()
+    return t("{jour}/{mois}/{annee}", jour=f"{n:%d}", mois=f"{n:%m}", annee=f"{n:%Y}")
 
 
 def trouver_ffmpeg():
@@ -64,10 +66,10 @@ def centres(positions, fps, nb_images, largeur_source, axe=0, decale=AVANT):
     if not positions:
         return np.full(nb_images, largeur_source / 2)
     echelle = largeur_source / positions[0][5 + axe]    # positions mesurées sur l'image analysée
-    t = np.array([p[0] + decale for p in positions])
+    temps = np.array([p[0] + decale for p in positions])
     x = np.array([(p[1 + axe] + p[3 + axe] / 2) * echelle for p in positions])
-    ordre = np.argsort(t)
-    brut = np.interp(np.arange(nb_images) / fps, t[ordre], x[ordre])
+    ordre = np.argsort(temps)
+    brut = np.interp(np.arange(nb_images) / fps, temps[ordre], x[ordre])
     # lissage aller-retour : suit la tortue sans à-coups ni retard
     a = min(1.0, 1.5 / max(fps, 1))
     lisse = brut.copy()
@@ -98,7 +100,7 @@ def habillage(nom, sous_titre, quand, en_haut=False):
     y = 330 if en_haut else HAUTEUR - 330
     d.text((70, y), nom, font=f_nom, fill=(255, 255, 255), anchor="ls")
     d.text((74, y + 80), sous_titre, font=f_sous, fill=(217, 164, 65), anchor="ls")
-    d.text((74, y + 145), "à la mangeoire", font=f_petit, fill=(233, 238, 227, 200), anchor="ls")
+    d.text((74, y + 145), t("à la mangeoire"), font=f_petit, fill=(233, 238, 227, 200), anchor="ls")
     return calque
 
 
@@ -135,7 +137,7 @@ def faire_clip(source, sortie, nom, sous_titre="", positions=(), quand=None, ffm
     # tortue surtout dans le bas du cadre (bord de l'image) : le nom passe en haut pour ne pas la cacher
     y0s = np.clip(ys - ch / 2, 0, sh - ch)
     en_haut = bool(len(ys)) and float(np.median((ys - y0s) / ch)) > 0.55
-    calque = habillage(nom, sous_titre, quand or datetime.now().strftime("%d/%m/%Y"), en_haut)
+    calque = habillage(nom, sous_titre, quand or _aujourd_hui(), en_haut)
     alpha = np.asarray(calque)[..., 3:4].astype(np.float32) / 255
     couleur = np.asarray(calque)[..., 2::-1].astype(np.float32)          # RGBA -> BGR
     zones = [slice(0, 600)] if en_haut else [slice(0, 260), slice(HAUTEUR - 540, HAUTEUR)]   # parties habillées

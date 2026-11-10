@@ -12,9 +12,11 @@ sans autre bibliothèque.
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 import fiches
+import i18n
+from i18n import nombre, police_pil, t, tn
 
 JOURS = 30
 # page A4 à 150 points par pouce
@@ -27,12 +29,23 @@ VERT, AMBRE, ROUGE = (95, 150, 55), (196, 140, 40), (200, 60, 55)
 
 
 def police(taille, gras=False):
-    for nom in (["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"] if gras else ["segoeui.ttf", "arial.ttf"]):
-        try:
-            return ImageFont.truetype(nom, taille)
-        except OSError:
-            pass
-    return ImageFont.load_default()
+    """Police qui a les caractères de la langue de l'interface (CJK, thaï…)."""
+    return police_pil(taille, gras)
+
+
+def _date(iso):
+    """"2026-11-05" → « 05/11/2026 » dans l'ordre de la langue."""
+    return t("{jour}/{mois}/{annee}", jour=iso[8:10], mois=iso[5:7], annee=iso[:4]) if iso else ""
+
+
+def _jour_mois(iso):
+    return t("{jour}/{mois}", jour=iso[8:10], mois=iso[5:7]) if iso else ""
+
+
+def _decimales(v, n):
+    """Nombre à n décimales gardées (12,50 ou 12.50 selon la langue)."""
+    s = f"{v:.{n}f}"
+    return s.replace(".", ",") if i18n.langue in i18n.VIRGULE else s
 
 
 def _secondes(ligne):
@@ -83,10 +96,10 @@ def resume(series):
 def duree_lisible(secondes):
     secondes = int(round(secondes))
     if secondes < 60:
-        return f"{secondes} s"
+        return t("{n} s", n=secondes)
     if secondes < 3600:
-        return f"{secondes // 60} min"
-    return f"{secondes // 3600} h {secondes % 3600 // 60:02d}"
+        return t("{n} min", n=secondes // 60)
+    return t("{h} h {min}", h=secondes // 3600, min=f"{secondes % 3600 // 60:02d}")
 
 
 def graphique_repas(series, titre="", taille=(1060, 420), fond=(255, 255, 255), encre=ENCRE, discret=GRIS,
@@ -112,8 +125,8 @@ def graphique_repas(series, titre="", taille=(1060, 420), fond=(255, 255, 255), 
         v = k * pas
         y = y1 - (y1 - y0) * v / plafond
         d.line([(x0, y), (x1, y)], fill=filet, width=1)
-        d.text((x0 - 8, y), f"{v:g}", font=f_axe, fill=discret, anchor="rm")
-    d.text((0, y0 - 2), "min", font=f_axe, fill=discret, anchor="la")
+        d.text((x0 - 8, y), nombre(v, 2), font=f_axe, fill=discret, anchor="rm")
+    d.text((0, y0 - 2), t("min"), font=f_axe, fill=discret, anchor="la")
     n = len(series)
     largeur = (x1 - x0) / max(n, 1)
     for i, ((jour, s, nb), m) in enumerate(zip(series, minutes)):
@@ -123,14 +136,14 @@ def graphique_repas(series, titre="", taille=(1060, 420), fond=(255, 255, 255), 
         else:
             d.line([(bx0, y1 + 3), (bx1, y1 + 3)], fill=vide, width=3)
         if i % 5 == 0 or i == n - 1:
-            d.text(((bx0 + bx1) / 2, y1 + 8), jour.strftime("%d/%m"), font=f_axe, fill=discret, anchor="ma")
+            d.text(((bx0 + bx1) / 2, y1 + 8), _jour_mois(jour.isoformat()), font=f_axe, fill=discret, anchor="ma")
     venus = [m for m, (_j, _s, nb) in zip(minutes, series) if nb]
     if venus:
         moy = sum(venus) / len(venus)
         y = y1 - (y1 - y0) * moy / plafond
         for x in range(x0, x1, 14):
             d.line([(x, y), (min(x + 7, x1), y)], fill=AMBRE, width=2)
-        texte = f"moyenne {duree_lisible(moy * 60)} par jour venu"
+        texte = t("moyenne {duree} par jour venu", duree=duree_lisible(moy * 60))
         boite = d.textbbox((x1 - 4, y - 6), texte, font=f_axe, anchor="rd")
         d.rectangle([boite[0] - 6, boite[1] - 3, boite[2] + 4, boite[3] + 3], fill=fond)
         d.text((x1 - 4, y - 6), texte, font=f_axe, fill=AMBRE, anchor="rd")
@@ -142,8 +155,9 @@ def graphique_repas(series, titre="", taille=(1060, 420), fond=(255, 255, 255), 
 def poids_lisible(g):
     """En grammes jusqu'à 10 kg (le vétérinaire suit le gramme), en kg au-delà."""
     if g >= 10000:
-        return f"{g / 1000:.2f} kg".replace(".", ",")
-    return f"{g:,.0f} g".replace(",", " ")
+        return t("{v} kg", v=_decimales(g / 1000, 2))
+    # milliers séparés par une espace fine (1 500 g) ; virgule en anglais, chinois… (1,500 g)
+    return t("{v} g", v=f"{g:,.0f}".replace(",", " " if i18n.langue in i18n.VIRGULE else ","))
 
 
 def bilan_poids(pesees, fin=None):
@@ -178,7 +192,8 @@ def ecart_lisible(e):
     if not e:
         return "—"
     signe = "+" if e["g"] >= 0 else "−"
-    return f"{signe}{poids_lisible(abs(e['g']))} ({signe}{abs(e['pct']):.1f} %)".replace(".", ",")
+    pct = _decimales(abs(e["pct"]), 1) + (" %" if i18n.langue == "fr" else "%")
+    return f"{signe}{poids_lisible(abs(e['g']))} ({signe}{pct})"
 
 
 def graphique_poids(pesees, titre="", taille=(1060, 420), fond=(255, 255, 255), encre=ENCRE, discret=GRIS,
@@ -195,7 +210,7 @@ def graphique_poids(pesees, titre="", taille=(1060, 420), fond=(255, 255, 255), 
         haut = int(f_titre.size * 1.6)
     pesees = sorted(pesees, key=lambda p: p["date"])
     if not pesees:
-        d.text((l / 2, h / 2), "Aucune pesée : ajoutez-en une.", font=f_titre, fill=discret, anchor="mm")
+        d.text((l / 2, h / 2), t("Aucune pesée : ajoutez-en une."), font=f_titre, fill=discret, anchor="mm")
         return img
     gauche, bas = int(f_axe.size * 5.5), int(f_axe.size * 2.4)
     x0, y0, x1, y1 = gauche, haut + 10, l - 24, h - bas
@@ -233,7 +248,7 @@ def graphique_poids(pesees, titre="", taille=(1060, 420), fond=(255, 255, 255), 
         jour = j0 + timedelta(days=round((j1 - j0).days * k / n_reperes))
         x = position(jour, bas_g)[0]
         ancre = "la" if k == 0 else "ra" if k == n_reperes else "ma"     # rien ne dépasse du cadre
-        d.text((x, y1 + 8), jour.strftime("%d/%m/%y"), font=f_axe, fill=discret, anchor=ancre)
+        d.text((x, y1 + 8), t("{jour}/{mois}/{annee}", jour=f"{jour:%d}", mois=f"{jour:%m}", annee=f"{jour:%y}"), font=f_axe, fill=discret, anchor=ancre)
     d.line([(x0, y1), (x1, y1)], fill=discret, width=1)
     return img
 
@@ -268,14 +283,14 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
     page1 = Image.new("RGB", PAGE, "white")
     d = ImageDraw.Draw(page1)
     y = MARGE
-    titre = fiche.get("nom", "Tortue")
+    titre = fiche.get("nom") or t("Tortue")
     while d.textlength(titre, font=f_titre) > PAGE[0] - 2 * MARGE - 360 and len(titre) > 4:
         titre = titre[:-2].rstrip() + "…" if not titre.endswith("…") else titre[:-2] + "…"
     d.text((MARGE, y), titre, font=f_titre, fill=ENCRE)
     y += 70
     d.text((MARGE, y), fiches.resume_identite(fiche, fin), font=f_sous, fill=GRIS)
-    d.text((PAGE[0] - MARGE, MARGE + 12), f"Fiche du {fin.strftime('%d/%m/%Y')}", font=f_texte, fill=GRIS, anchor="ra")
-    d.text((PAGE[0] - MARGE, MARGE + 50), f"Réf. {cle}", font=f_petit, fill=GRIS, anchor="ra")
+    d.text((PAGE[0] - MARGE, MARGE + 12), t("Fiche du {date}", date=_date(fin.isoformat())), font=f_texte, fill=GRIS, anchor="ra")
+    d.text((PAGE[0] - MARGE, MARGE + 50), t("Réf. {cle}", cle=cle), font=f_petit, fill=GRIS, anchor="ra")
     y += 60
     d.line([(MARGE, y), (PAGE[0] - MARGE, y)], fill=FILET, width=2)
     y += 30
@@ -291,66 +306,67 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
             x += v.width + 20
             hauteur_photos = max(hauteur_photos, v.height)
     if not photos:
-        d.text((MARGE, y), "Pas de photo de référence dans la galerie.", font=f_texte, fill=GRIS)
+        d.text((MARGE, y), t("Pas de photo de référence dans la galerie."), font=f_texte, fill=GRIS)
         hauteur_photos = 40
     y += hauteur_photos + 40
 
-    d.text((MARGE, y), f"Repas des {jours} derniers jours (du {series[0][0].strftime('%d/%m')} au "
-                       f"{series[-1][0].strftime('%d/%m/%Y')})", font=f_gras, fill=ENCRE)
+    d.text((MARGE, y), t("Repas des {jours} derniers jours (du {debut} au {fin})", jours=jours,
+                         debut=_jour_mois(series[0][0].isoformat()), fin=_date(series[-1][0].isoformat())),
+           font=f_gras, fill=ENCRE)
     y += 50
     lignes = [
-        ("Visites à la mangeoire", r["visites"]),
-        ("Jours où elle est venue", f"{r['jours_venue']} sur {r['jours']}"),
-        ("Temps total à table", duree_lisible(r["total_s"])),
-        ("Moyenne par jour venu", duree_lisible(r["moyenne_s"])),
-        ("Plus longue absence", f"{r['absence_max']} jour{'s' if r['absence_max'] > 1 else ''}"),
-        ("Dernière visite", f"{visites[0]['date'][8:10]}/{visites[0]['date'][5:7]}/{visites[0]['date'][:4]} à {visites[0].get('heure', '')[:5]}"
-         if visites else "aucune"),
+        (t("Visites à la mangeoire"), r["visites"]),
+        (t("Jours où elle est venue"), t("{venus} sur {jours}", venus=r["jours_venue"], jours=r["jours"])),
+        (t("Temps total à table"), duree_lisible(r["total_s"])),
+        (t("Moyenne par jour venu"), duree_lisible(r["moyenne_s"])),
+        (t("Plus longue absence"), tn("{n} jour", "{n} jours", r["absence_max"])),
+        (t("Dernière visite"), t("{date} à {heure}", date=_date(visites[0]["date"]), heure=visites[0].get("heure", "")[:5])
+         if visites else t("aucune")),
     ]
     if fiche.get("arrivee"):
-        lignes.append(("Arrivée à la maison", fiches.date_lisible(fiche["arrivee"])))
+        lignes.append((t("Arrivée à la maison"), fiches.date_lisible(fiche["arrivee"])))
     if fiche.get("signes"):
-        lignes.append(("Signes distinctifs", fiche["signes"][:38] + ("…" if len(fiche["signes"]) > 38 else "")))
+        lignes.append((t("Signes distinctifs"), fiche["signes"][:38] + ("…" if len(fiche["signes"]) > 38 else "")))
     bp = bilan_poids(fiche.get("pesees", []), fin)
     if bp:
-        jour = bp["dernier"]["date"]
-        lignes.append(("Dernier poids", f"{poids_lisible(bp['dernier']['g'])} le {jour[8:10]}/{jour[5:7]}/{jour[:4]}"))
+        lignes.append((t("Dernier poids"), t("{poids} le {date}", poids=poids_lisible(bp["dernier"]["g"]),
+                                            date=_date(bp["dernier"]["date"]))))
     for etiquette, valeur in lignes:
         d.text((MARGE, y), etiquette, font=f_texte, fill=GRIS)
         d.text((MARGE + 520, y), str(valeur), font=f_texte, fill=ENCRE)
         y += 42
     if r["absence_actuelle"] >= 3:
         y += 6
-        d.text((MARGE, y), f"Pas vue depuis {r['absence_actuelle']} jours.", font=f_gras, fill=ROUGE)
+        d.text((MARGE, y), tn("Pas vue depuis {n} jour.", "Pas vue depuis {n} jours.", r["absence_actuelle"]), font=f_gras, fill=ROUGE)
         y += 44
     y += 24
-    graphe = graphique_repas(series, "Minutes à table par jour", (PAGE[0] - 2 * MARGE, 520))
+    graphe = graphique_repas(series, t("Minutes à table par jour"), (PAGE[0] - 2 * MARGE, 520))
     page1.paste(graphe, (MARGE, y))
     y += graphe.height + 30
-    d.text((MARGE, y), "Les barres comptent les visites où la tortue a été reconnue ou confirmée. Un trait rouge "
-                       "marque un jour sans visite.", font=f_petit, fill=GRIS)
+    d.text((MARGE, y), t("Les barres comptent les visites où la tortue a été reconnue ou confirmée. Un trait rouge "
+                         "marque un jour sans visite."), font=f_petit, fill=GRIS)
     y += 32
-    d.text((MARGE, y), "Durées mesurées par vidéo : elles indiquent la présence à la mangeoire, pas la quantité "
-                       "mangée.", font=f_petit, fill=GRIS)
-    d.text((PAGE[0] / 2, PAGE[1] - 60), "Broutille — page 1/2", font=f_petit, fill=GRIS, anchor="ma")
+    d.text((MARGE, y), t("Durées mesurées par vidéo : elles indiquent la présence à la mangeoire, pas la quantité "
+                         "mangée."), font=f_petit, fill=GRIS)
+    d.text((PAGE[0] / 2, PAGE[1] - 60), t("Broutille — page {page}/{total}", page=1, total=2), font=f_petit, fill=GRIS, anchor="ma")
 
     # page 2 : poids, puis dernières visites, avec la photo de la tortue quand elle existe encore
     page2 = Image.new("RGB", PAGE, "white")
     d = ImageDraw.Draw(page2)
     y = MARGE
-    d.text((MARGE, y), f"{fiche.get('nom', 'Tortue')} — poids", font=f_gras, fill=ENCRE)
+    d.text((MARGE, y), t("{nom} — poids", nom=fiche.get("nom") or t("Tortue")), font=f_gras, fill=ENCRE)
     y += 54
     max_visites = 18
     if bp:
-        for etiquette, valeur in (("Pesées enregistrées", bp["nombre"]),
-                                  ("Depuis la pesée précédente", ecart_lisible(bp["precedente"])),
-                                  ("Sur 30 jours", ecart_lisible(bp["mois"])),
-                                  ("Sur un an", ecart_lisible(bp["an"]))):
+        for etiquette, valeur in ((t("Pesées enregistrées"), bp["nombre"]),
+                                  (t("Depuis la pesée précédente"), ecart_lisible(bp["precedente"])),
+                                  (t("Sur 30 jours"), ecart_lisible(bp["mois"])),
+                                  (t("Sur un an"), ecart_lisible(bp["an"]))):
             d.text((MARGE, y), etiquette, font=f_texte, fill=GRIS)
             d.text((MARGE + 520, y), str(valeur), font=f_texte, fill=ENCRE)
             y += 40
         if bp["alerte"]:
-            d.text((MARGE, y), "Perte de poids de 10 % ou plus.", font=f_gras, fill=ROUGE)
+            d.text((MARGE, y), t("Perte de poids de 10 % ou plus."), font=f_gras, fill=ROUGE)
             y += 44
         y += 10
         graphe = graphique_poids(fiche.get("pesees", []), "", (PAGE[0] - 2 * MARGE, 400))
@@ -358,30 +374,30 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
         y += graphe.height + 50
         max_visites = 8
     else:
-        d.text((MARGE, y), "Aucune pesée enregistrée.", font=f_texte, fill=GRIS)
+        d.text((MARGE, y), t("Aucune pesée enregistrée."), font=f_texte, fill=GRIS)
         y += 70
-    d.text((MARGE, y), "Dernières visites", font=f_gras, fill=ENCRE)
+    d.text((MARGE, y), t("Dernières visites"), font=f_gras, fill=ENCRE)
     y += 56
     largeurs = (230, 140, 170, 240)
-    _ligne_tableau(d, y, ("Date", "Heure", "Durée", "Remarque"), largeurs, f_gras, GRIS)
+    _ligne_tableau(d, y, (t("Date"), t("Heure"), t("Durée"), t("Remarque")), largeurs, f_gras, GRIS)
     y += 46
     d.line([(MARGE, y - 8), (PAGE[0] - MARGE, y - 8)], fill=FILET, width=2)
     vignettes = []
     for l in visites[:max_visites]:
         jour = l.get("date", "")
-        remarque = "corrigée à la main" if l.get("corrige") else ""
-        _ligne_tableau(d, y, (f"{jour[8:10]}/{jour[5:7]}/{jour[:4]}", l.get("heure", "")[:5],
+        remarque = t("corrigée à la main") if l.get("corrige") else ""
+        _ligne_tableau(d, y, (_date(jour), l.get("heure", "")[:5],
                               duree_lisible(_secondes(l)), remarque), largeurs, f_texte)
         y += 40
         photo = dossier / f"{l.get('id_visite', '')}_tortue.jpg"
         if photo.exists() and len(vignettes) < 8:
             vignettes.append((photo, jour))
     if not visites:
-        d.text((MARGE, y), "Aucune visite enregistrée.", font=f_texte, fill=GRIS)
+        d.text((MARGE, y), t("Aucune visite enregistrée."), font=f_texte, fill=GRIS)
         y += 40
     if vignettes:
         y += 30
-        d.text((MARGE, y), "Photos des dernières visites", font=f_gras, fill=ENCRE)
+        d.text((MARGE, y), t("Photos des dernières visites"), font=f_gras, fill=ENCRE)
         y += 50
         x = MARGE
         for photo, jour in vignettes:
@@ -393,9 +409,9 @@ def fiche_veterinaire(chemin_pdf, dossier, fiche, cle, journal, jours=JOURS, fin
             if y + v.height > PAGE[1] - 120:
                 break
             page2.paste(v, (x, y))
-            d.text((x, y + v.height + 6), f"{jour[8:10]}/{jour[5:7]}", font=f_petit, fill=GRIS)
+            d.text((x, y + v.height + 6), _jour_mois(jour), font=f_petit, fill=GRIS)
             x += v.width + 22
-    d.text((PAGE[0] / 2, PAGE[1] - 60), "Broutille — page 2/2", font=f_petit, fill=GRIS, anchor="ma")
+    d.text((PAGE[0] / 2, PAGE[1] - 60), t("Broutille — page {page}/{total}", page=2, total=2), font=f_petit, fill=GRIS, anchor="ma")
 
     chemin_pdf = Path(chemin_pdf)
     page1.save(chemin_pdf, "PDF", resolution=150, save_all=True, append_images=[page2])

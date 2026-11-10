@@ -10,6 +10,7 @@ Internet. Sans dépendance : http.server de Python, page HTML intégrée.
 """
 import hashlib
 import hmac
+import html
 import json
 import re
 import secrets
@@ -24,14 +25,17 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 import fiches
+import i18n
 import rapports
 from broutille_cam import ALBUM, INCONNUE, JournalOccupe, lire_journal, nom_fichier, secondes
+from i18n import t
 
 PORT = 8642                      # 8765 est souvent pris (autres petits serveurs maison)
 MAX_PHOTO = 25 * 1024 * 1024
+TEXTE = "text/plain; charset=utf-8"
 ESSAIS_MAX, BLOCAGE_S = 8, 600       # code faux 8 fois : adresse bloquée 10 min
 ESSAIS_MAX_TOTAL = 30                 # tous appareils confondus : au-delà, plus aucun code accepté 10 min
 PAUSE_ECHEC_S = 1.0                   # chaque code faux coûte une seconde : essayer en masse devient inutile
@@ -55,17 +59,23 @@ def adresse_locale():
 
 
 def _police(taille, gras=False):
-    for nom in (["seguisb.ttf", "segoeuib.ttf"] if gras else ["segoeui.ttf"]):
-        try:
-            return ImageFont.truetype(nom, taille)
-        except OSError:
-            pass
-    return ImageFont.load_default()
+    """Police de la langue choisie (caractères chinois, japonais, coréens, thaïs compris)."""
+    return i18n.police_pil(taille, gras)
 
 
 def duree_lisible(s):
     s = int(s)
-    return f"{s} s" if s < 60 else f"{s // 60} min" if s < 3600 else f"{s // 3600} h {s % 3600 // 60:02d}"
+    if s < 60:
+        return t("{n} s", n=s)
+    if s < 3600:
+        return t("{n} min", n=s // 60)
+    return t("{h} h {min}", h=s // 3600, min=f"{s % 3600 // 60:02d}")
+
+
+def _json_script(valeur):
+    """JSON qu'on peut poser dans une balise <script> : ni « </script> », ni « <!-- », ni fin de ligne JS."""
+    return (json.dumps(valeur, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 def jour_fr(iso):
@@ -131,8 +141,8 @@ class Serveur:
         """JPEG de l'image en cours, avec le nom des tortues reconnues ; None sans surveillance.
         Encodée une fois pour tous les spectateurs (au plus ~6 fois par seconde)."""
         with self._verrou_image:
-            t, jpeg = self._image
-            if jpeg is not None and time.time() - t < 0.15:
+            instant, jpeg = self._image
+            if jpeg is not None and time.time() - instant < 0.15:
                 return jpeg
             jpeg = self._encoder_direct(largeur)
             self._image = (time.time(), jpeg)
@@ -153,7 +163,7 @@ class Serveur:
             if not sure:
                 continue
             cle = reste[0] if reste else None
-            nom = fiches_[cle]["nom"] if cle in fiches_ and not texte.endswith("?") else "Tortue"
+            nom = fiches_[cle]["nom"] if cle in fiches_ and not texte.endswith("?") else t("Tortue")
             x, y, bw, bh = (int(v * e) for v in boite)
             d.rounded_rectangle([x, y, x + bw, y + bh], radius=10, outline=(217, 164, 65, 255), width=3)
             tw = d.textlength(nom, font=self.f_nom)
@@ -166,7 +176,7 @@ class Serveur:
     def image_attente(self):
         img = Image.new("RGB", (960, 540), (16, 20, 15))
         d = ImageDraw.Draw(img)
-        d.text((480, 270), "Surveillance arrêtée", font=self.f_nom, fill=(151, 163, 141), anchor="mm")
+        d.text((480, 270), t("Surveillance arrêtée"), font=self.f_nom, fill=(151, 163, 141), anchor="mm")
         ok, jpeg = cv2.imencode(".jpg", cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR))
         return jpeg.tobytes()
 
@@ -192,8 +202,11 @@ class Serveur:
         derniere = None
         if journal:
             l = journal[-1]
-            derniere = {"nom": f"{l['proposition']} ?" if l.get("proposition") else l["individu"],
-                        "quand": f"{jour_fr(l['date'])} à {l['heure'][:5]}", "duree": duree_lisible(secondes(l)),
+            # « Inconnue » est la valeur du journal (en français) : traduite ici, pour l'affichage
+            individu = t(INCONNUE) if l["individu"] == INCONNUE else l["individu"]
+            derniere = {"nom": t("{nom} ?", nom=l["proposition"]) if l.get("proposition") else individu,
+                        "quand": t("{date} à {heure}", date=jour_fr(l["date"]), heure=l["heure"][:5]),
+                        "duree": duree_lisible(secondes(l)),
                         "photo": Path(l["photo"]).name if l.get("photo") else ""}
         tortues = []
         for cle, f in sorted(self.registre.copie_fiches().items(), key=lambda x: (x[1].get("provisoire", False), x[1]["nom"])):
@@ -227,22 +240,24 @@ class Serveur:
                 "notes": f.get("notes", ""),
                 "pesees": [{"date": jour_fr(p["date"]) + "/" + p["date"][:4], "poids": rapports.poids_lisible(p["g"]),
                             "note": p.get("note", "")} for p in reversed(pesees[-12:])],
-                "carnet": [{"date": jour_fr(n["date"]) + "/" + n["date"][:4], "type": n.get("type", ""), "texte": n["texte"]}
+                "carnet": [{"date": jour_fr(n["date"]) + "/" + n["date"][:4],
+                            "type": t(n["type"]) if n.get("type") else "", "texte": n["texte"]}
                            for n in reversed(self.registre.carnet(cle)[-20:])],
                 "album": [p.name for p in self.registre.album(cle)[:24]],
-                "types": list(fiches.TYPES_CARNET)}
+                # types enregistrés en français (valeur envoyée) et leur nom affiché
+                "types": list(fiches.TYPES_CARNET), "noms_types": {x: t(x) for x in fiches.TYPES_CARNET}}
 
     # --- sécurité
     def bloque(self, ip):
         with self._verrou_codes:
             maintenant = time.time()
-            self.echecs_total = [t for t in self.echecs_total if maintenant - t < BLOCAGE_S]
+            self.echecs_total = [e for e in self.echecs_total if maintenant - e < BLOCAGE_S]
             if len(self.echecs_total) >= ESSAIS_MAX_TOTAL:
                 return True
-            n, t = self.echecs.get(ip, (0, 0))
-            if n >= ESSAIS_MAX and maintenant - t < BLOCAGE_S:
+            n, dernier = self.echecs.get(ip, (0, 0))
+            if n >= ESSAIS_MAX and maintenant - dernier < BLOCAGE_S:
                 return True
-            if n >= ESSAIS_MAX or (n and maintenant - t >= BLOCAGE_S):
+            if n >= ESSAIS_MAX or (n and maintenant - dernier >= BLOCAGE_S):
                 self.echecs.pop(ip, None)
             return False
 
@@ -291,7 +306,7 @@ class _Gestion(BaseHTTPRequestHandler):
         domaine vers ce PC (« DNS rebinding ») est refusée."""
         if HOTE_PERMIS.match(self.headers.get("Host", "")):
             return True
-        self._envoyer(421, "hôte refusé", "text/plain")
+        self._envoyer(421, t("hôte refusé"), TEXTE)
         self.close_connection = True
         return False
 
@@ -305,7 +320,7 @@ class _Gestion(BaseHTTPRequestHandler):
         except Exception:               # jamais de connexion coupée sans réponse
             self.close_connection = True
             try:
-                self._envoyer(500, "erreur", "text/plain")
+                self._envoyer(500, t("erreur"), TEXTE)
             except OSError:
                 pass
 
@@ -345,10 +360,10 @@ class _Gestion(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            raise ValueError("taille illisible") from None
+            raise ValueError(t("taille illisible")) from None
         if not 0 <= n <= maxi:          # négatif : read(-1) lirait jusqu'à la fin, sans limite
             self.close_connection = True    # corps non lu : la connexion ne peut pas resservir
-            raise ValueError("taille refusée")
+            raise ValueError(t("taille refusée"))
         return self.rfile.read(n)
 
     def _fichier_image(self, chemin):
@@ -362,7 +377,7 @@ class _Gestion(BaseHTTPRequestHandler):
                 tampon.seek(0)
                 self._envoyer(200, tampon.read(), "image/jpeg")
         except (OSError, ValueError):
-            self._envoyer(404, "introuvable", "text/plain")
+            self._envoyer(404, t("introuvable"), TEXTE)
 
     # --- GET
     def do_GET(self):
@@ -377,23 +392,23 @@ class _Gestion(BaseHTTPRequestHandler):
                 self._envoyer(303, "", entetes=[("Location", "/"), ("Set-Cookie",
                               f"broutille={self.app.jeton}; Max-Age=31536000; HttpOnly; SameSite=Strict; Path=/")])
             else:
-                self._envoyer(403, PAGE_CODE.replace("{erreur}", "Code faux." if not self.app.bloque(ip)
-                                                     else "Trop d'essais : réessayez dans 10 minutes."))
+                self._envoyer(403, page_code(t("Code faux.") if not self.app.bloque(ip)
+                                             else t("Trop d'essais : réessayez dans 10 minutes.")))
             return
         if not self._autorise():
-            self._envoyer(200 if url.path == "/" else 403, PAGE_CODE.replace("{erreur}", ""))
+            self._envoyer(200 if url.path == "/" else 403, page_code())
             return
         self._route_get(unquote(url.path), q)
 
     def _route_get(self, chemin, q):
         a = self.app
         if chemin == "/":
-            self._envoyer(200, PAGE)
+            self._envoyer(200, page())
         elif chemin == "/api/etat":
             self._json(a.etat())
         elif chemin == "/api/tortue":
-            t = a.tortue(q.get("cle", [""])[0])
-            self._json(t, 200) if t else self._json({"erreur": "inconnue"}, 404)
+            f = a.tortue(q.get("cle", [""])[0])
+            self._json(f, 200) if f else self._json({"erreur": t("inconnue")}, 404)
         elif chemin == "/image.jpg":
             self._envoyer(200, a.image_direct() or a.image_attente(), "image/jpeg")
         elif chemin == "/direct.mjpg":
@@ -422,7 +437,7 @@ class _Gestion(BaseHTTPRequestHandler):
             else:
                 self._envoyer(404, "", "text/plain")
         else:
-            self._envoyer(404, "introuvable", "text/plain")
+            self._envoyer(404, t("introuvable"), TEXTE)
 
     def _envoyer_video(self, chemin, telecharger=False):
         """MP4 avec prise en charge des plages (Range) : le lecteur vidéo de l'iPhone l'exige."""
@@ -467,7 +482,7 @@ class _Gestion(BaseHTTPRequestHandler):
     def _mjpeg(self):
         """Direct en MJPEG, ~5 images/s : lu tel quel par la balise <img> du navigateur du téléphone."""
         if not self.app.flux.acquire(blocking=False):
-            self._envoyer(503, "trop de directs ouverts", "text/plain")
+            self._envoyer(503, t("trop de directs ouverts"), TEXTE)
             return
         try:
             self._flux_mjpeg()
@@ -505,8 +520,8 @@ class _Gestion(BaseHTTPRequestHandler):
                 self._envoyer(303, "", entetes=[("Location", "/"), ("Set-Cookie",
                               f"broutille={self.app.jeton}; Max-Age=31536000; HttpOnly; SameSite=Strict; Path=/")])
             else:
-                msg = "Trop d'essais : réessayez dans 10 minutes." if self.app.bloque(ip) else "Code faux."
-                self._envoyer(403, PAGE_CODE.replace("{erreur}", msg))
+                msg = t("Trop d'essais : réessayez dans 10 minutes.") if self.app.bloque(ip) else t("Code faux.")
+                self._envoyer(403, page_code(msg))
             return
         if not self._autorise():
             self._json({"erreur": "code"}, 403)
@@ -517,10 +532,10 @@ class _Gestion(BaseHTTPRequestHandler):
             if url.path == "/api/photo":
                 cle = q.get("cle", [""])[0]
                 if cle not in a.registre.fiches:
-                    raise ValueError("tortue inconnue")
+                    raise ValueError(t("tortue inconnue"))
                 if not a.envois.acquire(timeout=30):
                     self.close_connection = True
-                    raise ValueError("occupé : réessayez")
+                    raise ValueError(t("occupé : réessayez"))
                 try:
                     corps = self._lire_corps(MAX_PHOTO)
                     nom = nom_fichier(Path(q.get("nom", ["telephone"])[0]).stem)[:30] or "telephone"
@@ -529,47 +544,64 @@ class _Gestion(BaseHTTPRequestHandler):
                         tmp.write_bytes(corps)
                         del corps
                         if not a.registre.ajouter_album(cle, [tmp]):
-                            raise ValueError("photo illisible")
+                            raise ValueError(t("photo illisible"))
                 finally:
                     a.envois.release()
             else:
                 donnees = json.loads(self._lire_corps(20000) or b"{}")
                 if not isinstance(donnees, dict):
-                    raise ValueError("données illisibles")
+                    raise ValueError(t("données illisibles"))
                 cle = donnees.get("cle", "")
                 if cle not in a.registre.fiches:
-                    raise ValueError("tortue inconnue")
-                jour = date.fromisoformat(donnees.get("date") or date.today().isoformat())
+                    raise ValueError(t("tortue inconnue"))
+                try:
+                    jour = date.fromisoformat(str(donnees.get("date") or date.today().isoformat()))
+                except ValueError:
+                    raise ValueError(t("date illisible")) from None
                 if jour > date.today():
-                    raise ValueError("date dans le futur")
+                    raise ValueError(t("date dans le futur"))
                 if url.path == "/api/pesee":
-                    g = float(str(donnees.get("g", "")).replace(",", ".").replace(" ", ""))
+                    try:
+                        g = float(str(donnees.get("g", "")).replace(",", ".").replace(" ", ""))
+                    except ValueError:
+                        raise ValueError(t("poids illisible")) from None
                     a.registre.ajouter_pesee(cle, jour.isoformat(), g, str(donnees.get("note", ""))[:200])
                 elif url.path == "/api/note":
                     a.registre.ajouter_note(cle, jour.isoformat(), str(donnees.get("type") or "Note")[:30],
                                             str(donnees.get("texte", ""))[:1000])
                 else:
-                    self._json({"erreur": "introuvable"}, 404)
+                    self._json({"erreur": t("introuvable")}, 404)
                     return
         except (ValueError, TypeError, KeyError) as e:
-            self._json({"erreur": str(e)}, 400)
+            self._json({"erreur": str(e) if not isinstance(e, KeyError) else t("inconnue")}, 400)
             return
         a.apres_modif()
         self._json({"ok": True})
 
 
-PAGE_CODE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+PAGE_CODE = """<!doctype html><html lang="{langue}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Broutille</title>
 <style>body{margin:0;background:#10140f;color:#e9eee3;font:17px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}
 form{background:#1b2119;padding:28px;border-radius:16px;width:min(320px,86vw)}h1{margin:0 0 6px}p{color:#97a38d;margin:0 0 18px}
 input{width:100%;box-sizing:border-box;font-size:28px;letter-spacing:6px;text-align:center;padding:12px;border-radius:10px;border:1px solid #2d3729;background:#10140f;color:#e9eee3}
 button{margin-top:14px;width:100%;padding:14px;font-size:17px;font-weight:600;border:0;border-radius:10px;background:#7fb950;color:#10200a}
 .e{color:#f85149;margin-top:12px;min-height:1em}</style></head><body>
-<form method="post" action="/connexion"><h1>Broutille</h1><p>Code affiché dans l'application, bouton 📱 Téléphone.</p>
+<form method="post" action="/connexion"><h1>Broutille</h1><p>{consigne}</p>
 <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" autofocus>
-<button>Entrer</button><div class="e">{erreur}</div></form></body></html>"""
+<button>{entrer}</button><div class="e">{erreur}</div></form></body></html>"""
 
-PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+
+def page_code(erreur=""):
+    """Page du code, dans la langue choisie ; chaque texte échappé (un catalogue ne peut pas glisser de HTML)."""
+    valeurs = {"langue": i18n.langue, "consigne": t("Code affiché dans l'application, bouton 📱 Téléphone."),
+               "entrer": t("Entrer"), "erreur": erreur}
+    # un seul passage : un texte traduit qui contiendrait « {erreur} » n'est pas remplacé à son tour
+    return re.sub(r"\{(langue|consigne|entrer|erreur)\}", lambda m: html.escape(valeurs[m.group(1)]), PAGE_CODE)
+
+
+# Page du téléphone. Chaque texte affiché y est écrit T("texte français exact") : le serveur y pose à chaque
+# demande le dictionnaire TR des traductions (à la place de /*TRADUCTIONS*/) et la langue.
+PAGE = r"""<!doctype html><html lang="__LANGUE__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#10140f"><title>Broutille</title>
 <style>
@@ -595,42 +627,60 @@ button.sec{background:var(--bord);color:var(--texte)}.album{display:grid;grid-te
 .clip a.b{display:inline-block;width:auto;margin-top:8px;padding:8px 14px;border-radius:10px;background:var(--vert);color:#10200a;font-weight:600;text-decoration:none}
 </style></head><body>
 <header><h1>🐢 Broutille</h1><span id="pastille" class="pastille">…</span></header>
-<img class="video" id="video" src="/direct.mjpg" alt="Direct de la mangeoire">
-<section><h2>Aujourd'hui à table</h2><div id="aujourdhui" class="discret">…</div></section>
-<section><h2>Dernière visite</h2><div id="derniere" class="discret">…</div></section>
-<section><h2>Mes tortues</h2><div id="tortues" class="tortues"></div></section>
-<section><h2>🎬 Clips à partager</h2><div id="clips" class="clips discret">…</div></section>
+<img class="video" id="video" src="/direct.mjpg" alt="">
+<section><h2 id="t-aujourdhui"></h2><div id="aujourdhui" class="discret">…</div></section>
+<section><h2 id="t-derniere"></h2><div id="derniere" class="discret">…</div></section>
+<section><h2 id="t-tortues"></h2><div id="tortues" class="tortues"></div></section>
+<section><h2 id="t-clips"></h2><div id="clips" class="clips discret">…</div></section>
 <dialog id="fiche"></dialog><div id="msg" class="msg"></div>
 <script>
+/*TRADUCTIONS*/
+function T(s,v){const r=TR[s]||s;return v?r.replace(/\{(\w+)\}/g,(m,k)=>k in v?String(v[k]):m):r}
+const PL=n=>LANGUE==="fr"?Math.abs(n)<2:n===1;
 const $=s=>document.querySelector(s), esc=t=>String(t??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const aujourdhui=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10);
+$("#video").alt=T("Direct de la mangeoire");
+$("#t-aujourdhui").textContent=T("Aujourd'hui à table");$("#t-derniere").textContent=T("Dernière visite");
+$("#t-tortues").textContent=T("Mes tortues");$("#t-clips").textContent="🎬 "+T("Clips à partager");
 function message(t,err){const m=$("#msg");m.textContent=t;m.className="msg"+(err?" err":"");m.style.display="block";setTimeout(()=>m.style.display="none",2500)}
-async function api(u,o){const r=await fetch(u,o);if(r.status===403){location.reload();throw 0}const j=await r.json();if(!r.ok)throw new Error(j.erreur||"erreur");return j}
+async function api(u,o){const r=await fetch(u,o);if(r.status===403){location.reload();throw 0}const j=await r.json();if(!r.ok)throw new Error(j.erreur||T("Erreur"));return j}
 async function etat(){try{const e=await api("/api/etat");
- const p=$("#pastille");p.textContent=!e.surveillance?"● En veille":e.presence?`● ${e.presence} à table`:"● Surveillance";p.className="pastille"+(e.presence?" table":e.surveillance?" on":"");
- $("#aujourdhui").innerHTML=e.aujourdhui.length?e.aujourdhui.map(x=>`<div class="ligne"><span>${esc(x.nom)}</span><span class="discret">${esc(x.duree)}</span></div>`).join(""):"Pas encore de repas";
- const d=e.derniere;$("#derniere").innerHTML=d?`<div class="derniere">${d.photo?`<img src="/img/visite/${encodeURIComponent(d.photo)}">`:""}<div><b>${esc(d.nom)}</b><br><span class="discret">${esc(d.quand)} · ${esc(d.duree)}</span></div></div>`:"Aucune visite";
- clips(e.clips||[]);$("#tortues").innerHTML=e.tortues.map(t=>`<button class="t" onclick="fiche('${esc(t.cle)}')"><img loading="lazy" src="/img/portrait/${esc(t.cle)}" onerror="this.style.visibility='hidden'"><div><b>${esc(t.nom)}</b><small>${t.vue?"vue le "+esc(t.vue):"jamais vue"}${t.poids?" · <span class='"+(t.alerte_poids?"alerte":"")+"'>"+esc(t.poids)+"</span>":""}</small></div></button>`).join("");
+ const p=$("#pastille");p.textContent="● "+(!e.surveillance?T("En veille"):e.presence?T("{n} à table",{n:e.presence}):T("Surveillance"));p.className="pastille"+(e.presence?" table":e.surveillance?" on":"");
+ $("#aujourdhui").innerHTML=e.aujourdhui.length?e.aujourdhui.map(x=>`<div class="ligne"><span>${esc(x.nom)}</span><span class="discret">${esc(x.duree)}</span></div>`).join(""):esc(T("Pas encore de repas"));
+ const d=e.derniere;$("#derniere").innerHTML=d?`<div class="derniere">${d.photo?`<img src="/img/visite/${encodeURIComponent(d.photo)}">`:""}<div><b>${esc(d.nom)}</b><br><span class="discret">${esc(d.quand)} · ${esc(d.duree)}</span></div></div>`:esc(T("Aucune visite"));
+ clips(e.clips||[]);$("#tortues").innerHTML=e.tortues.map(t=>`<button class="t" onclick="fiche('${esc(t.cle)}')"><img loading="lazy" src="/img/portrait/${esc(t.cle)}" onerror="this.style.visibility='hidden'"><div><b>${esc(t.nom)}</b><small>${t.vue?esc(T("vue le {date}",{date:t.vue})):esc(T("jamais vue"))}${t.poids?" · <span class='"+(t.alerte_poids?"alerte":"")+"'>"+esc(t.poids)+"</span>":""}</small></div></button>`).join("");
 }catch(e){}}
-async function fiche(cle){const t=await api("/api/tortue?cle="+encodeURIComponent(cle));const f=$("#fiche");
- f.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:start"><div><h1>${esc(t.nom)}</h1><div style="color:var(--ambre)">${esc(t.identite)}</div>${t.signes?`<div class="discret">${esc(t.signes)}</div>`:""}</div><button class="b sec" style="width:auto;margin:0;padding:8px 14px" onclick="fiche_fermer()">✕</button></div>
- <section><h2>⚖ Pesée</h2><div class="rang"><div><label>Poids (g)</label><input id="g" inputmode="decimal" placeholder="1250"></div><div><label>Date</label><input id="gd" type="date" value="${aujourdhui()}" max="${aujourdhui()}"></div></div>
- <label>Remarque</label><input id="gn"><button class="b" onclick="peser('${esc(cle)}')">Enregistrer la pesée</button>
+async function fiche(cle){const t=await api("/api/tortue?cle="+encodeURIComponent(cle));const f=$("#fiche");const noms=t.noms_types||{};
+ f.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:start"><div><h1>${esc(t.nom)}</h1><div style="color:var(--ambre)">${esc(t.identite)}</div>${t.signes?`<div class="discret">${esc(t.signes)}</div>`:""}</div><button class="b sec" style="width:auto;margin:0;padding:8px 14px" aria-label="${esc(T("Fermer"))}" onclick="fiche_fermer()">✕</button></div>
+ <section><h2>⚖ ${esc(T("Pesée"))}</h2><div class="rang"><div><label>${esc(T("Poids (g)"))}</label><input id="g" inputmode="decimal" placeholder="1250"></div><div><label>${esc(T("Date"))}</label><input id="gd" type="date" value="${aujourdhui()}" max="${aujourdhui()}"></div></div>
+ <label>${esc(T("Remarque"))}</label><input id="gn"><button class="b" onclick="peser('${esc(cle)}')">${esc(T("Enregistrer la pesée"))}</button>
  ${t.pesees.slice(0,4).map(p=>`<div class="ligne"><span>${esc(p.date)}</span><span>${esc(p.poids)}</span></div>`).join("")}</section>
- <section><h2>📒 Carnet</h2><div class="rang"><div><label>Type</label><select id="nt">${t.types.map(x=>`<option>${esc(x)}</option>`).join("")}</select></div><div><label>Date</label><input id="nd" type="date" value="${aujourdhui()}" max="${aujourdhui()}"></div></div>
- <label>Ce qui s'est passé</label><textarea id="nx" rows="2"></textarea><button class="b" onclick="noter('${esc(cle)}')">Noter</button>
+ <section><h2>📒 ${esc(T("Carnet"))}</h2><div class="rang"><div><label>${esc(T("Type"))}</label><select id="nt">${t.types.map(x=>`<option value="${esc(x)}">${esc(noms[x]||x)}</option>`).join("")}</select></div><div><label>${esc(T("Date"))}</label><input id="nd" type="date" value="${aujourdhui()}" max="${aujourdhui()}"></div></div>
+ <label>${esc(T("Ce qui s'est passé"))}</label><textarea id="nx" rows="2"></textarea><button class="b" onclick="noter('${esc(cle)}')">${esc(T("Noter"))}</button>
  ${t.carnet.slice(0,5).map(n=>`<div class="ligne"><span>${esc(n.date)} · ${esc(n.type)}</span><span class="discret" style="text-align:right;max-width:60%">${esc(n.texte)}</span></div>`).join("")}</section>
- <section><h2>🖼 Album</h2><label class="b" style="text-align:center;margin:0 0 10px;background:var(--vert);color:#10200a;font-weight:600;padding:12px;border-radius:10px">📷 Ajouter une photo<input type="file" accept="image/*" multiple hidden onchange="envoyer('${esc(cle)}',this.files)"></label>
+ <section><h2>🖼 ${esc(T("Album"))}</h2><label class="b" style="text-align:center;margin:0 0 10px;background:var(--vert);color:#10200a;font-weight:600;padding:12px;border-radius:10px">📷 ${esc(T("Ajouter une photo"))}<input type="file" accept="image/*" multiple hidden onchange="envoyer('${esc(cle)}',this.files)"></label>
  <div class="album">${t.album.map(n=>`<img loading="lazy" src="/img/album/${esc(cle)}/${encodeURIComponent(n)}">`).join("")}</div></section>`;
  if(!f.open)f.showModal()}
 function fiche_fermer(){$("#fiche").close()}
-async function peser(cle){try{await api("/api/pesee",{method:"POST",body:JSON.stringify({cle,g:$("#g").value,date:$("#gd").value,note:$("#gn").value})});message("Pesée enregistrée");fiche(cle);etat()}catch(e){message(e.message||"Erreur",1)}}
-async function noter(cle){try{await api("/api/note",{method:"POST",body:JSON.stringify({cle,type:$("#nt").value,date:$("#nd").value,texte:$("#nx").value})});message("Noté");fiche(cle)}catch(e){message(e.message||"Erreur",1)}}
-async function envoyer(cle,fichiers){let n=0;for(const f of fichiers){try{await api(`/api/photo?cle=${encodeURIComponent(cle)}&nom=${encodeURIComponent(f.name)}`,{method:"POST",body:f});n++}catch(e){message(e.message||"Erreur",1)}}
- if(n){message(n+" photo"+(n>1?"s":"")+" ajoutée"+(n>1?"s":""));fiche(cle);etat()}}
+async function peser(cle){try{await api("/api/pesee",{method:"POST",body:JSON.stringify({cle,g:$("#g").value,date:$("#gd").value,note:$("#gn").value})});message(T("Pesée enregistrée"));fiche(cle);etat()}catch(e){message(e.message||T("Erreur"),1)}}
+async function noter(cle){try{await api("/api/note",{method:"POST",body:JSON.stringify({cle,type:$("#nt").value,date:$("#nd").value,texte:$("#nx").value})});message(T("Noté"));fiche(cle)}catch(e){message(e.message||T("Erreur"),1)}}
+async function envoyer(cle,fichiers){let n=0;for(const f of fichiers){try{await api(`/api/photo?cle=${encodeURIComponent(cle)}&nom=${encodeURIComponent(f.name)}`,{method:"POST",body:f});n++}catch(e){message(e.message||T("Erreur"),1)}}
+ if(n){message(PL(n)?T("{n} photo ajoutée",{n}):T("{n} photos ajoutées",{n}));fiche(cle);etat()}}
 $("#video").onerror=()=>setTimeout(()=>$("#video").src="/direct.mjpg?"+Date.now(),3000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden){$("#video").src="/direct.mjpg?"+Date.now();etat()}});
 function clips(liste){const c=$("#clips");const avant=c.dataset.liste||"";const maintenant=liste.join("|");if(avant===maintenant)return;c.dataset.liste=maintenant;
- c.innerHTML=liste.length?liste.map(n=>`<div class="clip"><video controls playsinline preload="metadata" src="/clips/${encodeURIComponent(n)}#t=0.5"></video><div><b>${esc(n.slice(17,-4).replace(/_/g," "))}</b><br><span class="discret">${esc(n.slice(8,10)+"/"+n.slice(5,7)+" à "+n.slice(11,16).replace("-",":"))}</span><br><a class="b" href="/clips/${encodeURIComponent(n)}?telecharger=1" download>⬇ Télécharger</a></div></div>`).join(""):"Pas encore de clip : il s'en fait un après la visite d'une tortue reconnue."}
+ c.innerHTML=liste.length?liste.map(n=>`<div class="clip"><video controls playsinline preload="metadata" src="/clips/${encodeURIComponent(n)}#t=0.5"></video><div><b>${esc(n.slice(17,-4).replace(/_/g," "))}</b><br><span class="discret">${esc(T("{date} à {heure}",{date:n.slice(8,10)+"/"+n.slice(5,7),heure:n.slice(11,16).replace("-",":")}))}</span><br><a class="b" href="/clips/${encodeURIComponent(n)}?telecharger=1" download>⬇ ${esc(T("Télécharger"))}</a></div></div>`).join(""):esc(T("Pas encore de clip : il s'en fait un après la visite d'une tortue reconnue."))}
 etat();setInterval(etat,10000);
 </script></body></html>"""
+
+# textes de la page : tous les T("...") de PAGE, relevés ici pour ne jamais diverger de la page
+CLES_PAGE = list(dict.fromkeys(re.findall(r'\bT\("([^"\\]*)"', PAGE)))
+
+
+def page():
+    """Page du téléphone dans la langue choisie : traductions posées en JSON sûr dans la balise <script>."""
+    entete = (f"const TR = {_json_script(i18n.catalogue_web(CLES_PAGE))};\n"
+              f"const LANGUE = {_json_script(i18n.langue)};")
+    langue = i18n.langue if i18n.langue in i18n.LANGUES else "fr"
+    # la langue d'abord, les traductions en dernier : rien n'est remplacé à l'intérieur du JSON posé
+    return PAGE.replace("__LANGUE__", langue, 1).replace("/*TRADUCTIONS*/", entete, 1)

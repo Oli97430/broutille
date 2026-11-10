@@ -13,23 +13,38 @@ Champs d'une fiche du registre (tous facultatifs sauf nom et espèce) :
 """
 from datetime import date
 
+from i18n import t, tn
+
 SEXES = ("", "Mâle", "Femelle")
 TYPES_CARNET = ("Note", "Soin", "Vétérinaire", "Vermifuge", "Hibernation", "Ponte", "Mue / carapace")
 MOIS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
         "novembre", "décembre")
 
 
+def nom_mois(numero):
+    """Nom du mois (1-12) dans la langue de l'interface (MOIS reste en français)."""
+    return (t("janvier"), t("février"), t("mars"), t("avril"), t("mai"), t("juin"), t("juillet"), t("août"),
+            t("septembre"), t("octobre"), t("novembre"), t("décembre"))[numero - 1]
+
+
+def _cles_a_traduire():
+    """Jamais appelée : signale à tests/cles_i18n.py les valeurs stockées en français et traduites à
+    l'affichage par t(valeur) (sexe, types de carnet)."""
+    return (t("Mâle"), t("Femelle"), t("Note"), t("Soin"), t("Vétérinaire"), t("Vermifuge"), t("Hibernation"),
+            t("Ponte"), t("Mue / carapace"))
+
+
 def lire_date_partielle(texte, aujourd_hui=None):
     """« 2019 », « 03/2019 », « 15/03/2019 » ou ISO → "AAAA", "AAAA-MM" ou "AAAA-MM-JJ".
     Chaîne vide → "". ValueError si la date est impossible ou dans le futur."""
-    t = (texte or "").strip().replace(".", "/").replace("-", "/").replace(" ", "/")
-    morceaux = [m for m in t.split("/") if m]           # « 15 03 2019 » comme « 15/03/2019 »
+    propre = (texte or "").strip().replace(".", "/").replace("-", "/").replace(" ", "/")
+    morceaux = [m for m in propre.split("/") if m]           # « 15 03 2019 » comme « 15/03/2019 »
     if not morceaux:
         return ""
     if len(morceaux[0]) == 4:            # ISO : AAAA/MM/JJ
         morceaux = morceaux[::-1]
     if not all(m.isdigit() for m in morceaux) or len(morceaux) > 3:
-        raise ValueError(f"date illisible : « {texte} »")
+        raise ValueError(t("date illisible : « {saisie} »", saisie=texte))
     annee = int(morceaux[-1])
     aujourd_hui = aujourd_hui or date.today()
     if annee < 100:                      # « 03/19 » → 2019, « 03/99 » → 1999
@@ -38,18 +53,21 @@ def lire_date_partielle(texte, aujourd_hui=None):
     jour = int(morceaux[-3]) if len(morceaux) == 3 else None
     aujourd_hui = aujourd_hui or date.today()
     if not 1900 <= annee <= aujourd_hui.year:
-        raise ValueError(f"année impossible : {annee}")
+        raise ValueError(t("année impossible : {annee}", annee=annee))
     if mois is None:
         return f"{annee:04d}"
     if not 1 <= mois <= 12:
-        raise ValueError(f"mois impossible : {mois}")
+        raise ValueError(t("mois impossible : {mois}", mois=mois))
     if jour is None:
         if (annee, mois) > (aujourd_hui.year, aujourd_hui.month):
-            raise ValueError("date dans le futur")
+            raise ValueError(t("date dans le futur"))
         return f"{annee:04d}-{mois:02d}"
-    d = date(annee, mois, jour)           # ValueError si le 31/02
+    try:
+        d = date(annee, mois, jour)       # le 31/02
+    except ValueError:
+        raise ValueError(t("jour impossible : {jour}", jour=jour)) from None
     if d > aujourd_hui:
-        raise ValueError("date dans le futur")
+        raise ValueError(t("date dans le futur"))
     return d.isoformat()
 
 
@@ -61,8 +79,8 @@ def date_lisible(valeur):
     if len(p) == 1:
         return p[0]
     if len(p) == 2:
-        return f"{MOIS[int(p[1]) - 1]} {p[0]}"
-    return f"{p[2]}/{p[1]}/{p[0]}"
+        return t("{mois} {annee}", mois=nom_mois(int(p[1])), annee=p[0])
+    return t("{jour}/{mois}/{annee}", jour=p[2], mois=p[1], annee=p[0])
 
 
 def date_saisie(valeur):
@@ -91,25 +109,35 @@ def age_lisible(naissance, aujourd_hui=None):
     m = age_mois(naissance, aujourd_hui)
     if m is None:
         return ""
-    environ = "environ " if len(naissance) == 4 else ""
+    environ = len(naissance) == 4
+    # « mois » est invariable : le singulier a sa propre clé (« 1 mois », reste >= 1) pour que les
+    # autres langues puissent l'accorder (1 month / 2 months)
     ans, reste = divmod(m, 12)
     if ans == 0:
-        return environ + (f"{reste} mois" if reste else "moins d'un mois")
-    texte = f"{ans} an{'s' if ans > 1 else ''}"
-    if reste and ans < 3 and not environ:   # les mois ne comptent plus passé trois ans
-        texte += f" et {reste} mois"
-    return environ + texte
+        texte = tn("1 mois", "{n} mois", reste) if reste else t("moins d'un mois")
+    else:
+        texte = tn("{n} an", "{n} ans", ans)
+        if reste and ans < 3 and not environ:   # les mois ne comptent plus passé trois ans
+            texte = t("{ans} et {mois}", ans=texte, mois=tn("1 mois", "{n} mois", reste))
+    return t("environ {age}", age=texte) if environ else texte
 
 
 def resume_identite(fiche, aujourd_hui=None):
-    """Une ligne : « Tortue d'Hermann · Femelle · 7 ans (née en 2019) »."""
-    morceaux = [fiche.get("espece", "")]
+    """Une ligne : « Tortue d'Hermann · Femelle · 7 ans (née en 2019) ». Espèce et sexe sont stockés
+    en français : traduits ici, à l'affichage."""
+    espece = fiche.get("espece", "")
+    morceaux = [t(espece) if espece else ""]
     sexe = fiche.get("sexe", "")
     if sexe:
-        morceaux.append(sexe)
+        morceaux.append(t(sexe))
     if fiche.get("naissance"):
-        nee = "né" if sexe == "Mâle" else "née"
         quand = date_lisible(fiche["naissance"])
-        prefixe = "le " if len(fiche["naissance"]) == 10 else "en "
-        morceaux.append(f"{age_lisible(fiche['naissance'], aujourd_hui)} ({nee} {prefixe}{quand})")
+        age = age_lisible(fiche["naissance"], aujourd_hui)
+        if len(fiche["naissance"]) == 10:
+            texte = (t("{age} (né le {quand})", age=age, quand=quand) if sexe == "Mâle"
+                     else t("{age} (née le {quand})", age=age, quand=quand))
+        else:
+            texte = (t("{age} (né en {quand})", age=age, quand=quand) if sexe == "Mâle"
+                     else t("{age} (née en {quand})", age=age, quand=quand))
+        morceaux.append(texte)
     return "  ·  ".join(m for m in morceaux if m)

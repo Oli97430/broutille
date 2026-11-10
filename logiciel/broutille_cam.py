@@ -39,16 +39,24 @@ import numpy as np
 from PIL import Image, ImageOps
 
 import vision
+from i18n import t
 from sources import est_fichier, masquer, ouvrir_source, source_depuis_texte
 
 COLONNES = ["id_visite", "date", "heure", "duree_s", "individu", "espece", "confiance", "video", "photo", "source",
             "corrige", "id_individu", "proposition", "id_proposition", "camera"]
+# ces deux valeurs sont écrites telles quelles dans le journal et les fiches : traduites seulement à l'affichage
 INCONNUE = "Inconnue"
 PAS_UNE_TORTUE = "Pas une tortue"
 MAX_EXEMPLES = 60               # photos gardées par individu
 EXEMPLE_DIFFERENT = 0.92        # une nouvelle vue n'entre en galerie que si elle apporte du neuf
 ALBUM = "album"                 # individus/<id>/album : photos souvenirs, jamais lues par la reconnaissance
 CHAMPS_IDENTITE = ("sexe", "naissance", "arrivee", "origine", "signes", "notes", "profil")
+
+
+def _cles_a_traduire():
+    """Jamais appelée : signale à tests/cles_i18n.py les valeurs stockées en français et traduites à
+    l'affichage par t(valeur)."""
+    return t("Inconnue"), t("Pas une tortue")
 
 
 def sans_accents(texte):
@@ -119,7 +127,7 @@ def _insister(action, essais=6):
             return action()
         except PermissionError:
             if i == essais - 1:
-                raise JournalOccupe("visites.csv est ouvert dans un autre programme : fermez-le, puis réessayez") from None
+                raise JournalOccupe(t("visites.csv est ouvert dans un autre programme : fermez-le, puis réessayez")) from None
             time.sleep(0.25)
 
 
@@ -400,7 +408,7 @@ class Registre:
                     return
                 except (OSError, ValueError):
                     pass
-            raise RegistreIllisible(f"Fiches des tortues illisibles : {self.chemin}")
+            raise RegistreIllisible(t("Fiches des tortues illisibles : {fichier}", fichier=self.chemin))
 
     def _ecrire(self):
         self.dossier.mkdir(parents=True, exist_ok=True)
@@ -601,7 +609,7 @@ class Registre:
         """Ajoute une pesée ; une seconde pesée le même jour remplace la première."""
         grammes = float(grammes)
         if not 1 <= grammes <= 200000:
-            raise ValueError("poids hors limites (1 g à 200 kg)")
+            raise ValueError(t("poids hors limites (1 g à 200 kg)"))
         jour = date.fromisoformat(str(jour)).isoformat()
         with self._verrou:
             pesees = [p for p in self.fiches[cle].get("pesees", []) if p["date"] != jour]
@@ -622,7 +630,7 @@ class Registre:
     def ajouter_note(self, cle, jour, genre, texte):
         texte = texte.strip()
         if not texte:
-            raise ValueError("note vide")
+            raise ValueError(t("note vide"))
         jour = date.fromisoformat(str(jour)).isoformat()
         with self._verrou:
             carnet = self.fiches[cle].get("carnet", []) + [{"date": jour, "type": genre, "texte": texte}]
@@ -925,7 +933,7 @@ class LecteurCamera(threading.Thread):
                 self.en_lecture = False
                 camera.release()
             if not self.fin.is_set():
-                self.sur_message("Source interrompue, nouvelle tentative…")
+                self.sur_message(t("Source interrompue, nouvelle tentative…"))
                 self.fin.wait(2)
 
 
@@ -990,7 +998,7 @@ class Surveillance:
         try:
             fonction(*args)
         except Exception as e:      # disque plein, photo illisible... la surveillance continue
-            self.sur_message(f"Erreur : {type(e).__name__} : {e}")
+            self.sur_message(t("Erreur : {type} : {erreur}", type=type(e).__name__, erreur=e))
 
     def _tache(self, fonction, *args):
         """Travail lent de fin de visite : hors de la boucle, qui ne doit jamais attendre.
@@ -1020,7 +1028,7 @@ class Surveillance:
             chemin = base.with_name(f"{base.name}-{n}.mp4")
         video = cv2.VideoWriter(str(chemin), cv2.VideoWriter_fourcc(*"mp4v"), fps, taille)
         if not video.isOpened():
-            self.sur_message(f"Clip impossible à créer dans {self.dossier}")
+            self.sur_message(t("Clip impossible à créer dans {dossier}", dossier=self.dossier))
             return
         self.video, self.chemin_clip, self.nb_clip, self.debut_clip = video, chemin, 0, instant
         for _t, jpeg in tampon:
@@ -1127,7 +1135,7 @@ class Surveillance:
                 return False
             piste.nommee = cle
             piste.etiquette = PAS_UNE_TORTUE if cle == PAS_UNE_TORTUE else self.registre.fiches[cle]["nom"]
-        self.sur_message(f"Tortue nommée sur la vidéo : {piste.etiquette}")
+        self.sur_message(t("Tortue nommée sur la vidéo : {nom}", nom=piste.etiquette))
         return True
 
     def _seuil_image(self):
@@ -1214,9 +1222,9 @@ class Surveillance:
             try:
                 cle = r.creer(r.nom_provisoire(espece), espece, provisoire=True)
                 score, source, nouvelle = 0.0, "nouvelle", True
-                self.sur_message(f"Nouvelle tortue : {r.fiches[cle]['nom']}")
+                self.sur_message(t("Nouvelle tortue : {nom}", nom=r.fiches[cle]["nom"]))
             except OSError as e:
-                self.sur_message(f"Fiche nouvelle impossible : {e}")
+                self.sur_message(t("Fiche nouvelle impossible : {erreur}", erreur=e))
         base_visite = f"{piste.arrivee:%Y-%m-%d_%H-%M-%S}_{piste.numero}"
         photo = ""
         if piste.exemples:
@@ -1225,7 +1233,7 @@ class Surveillance:
                 ecrire_image(self.dossier / f"{base_visite}_tortue.jpg", piste.exemples[0][1])
                 photo = f"{base_visite}_photo.jpg"
             except Exception as e:
-                self.sur_message(f"Photo de visite non écrite : {e}")
+                self.sur_message(t("Photo de visite non écrite : {erreur}", erreur=e))
         # fiche relue sous le verrou du journal : une fusion ou une suppression faite pendant ce
         # temps depuis l'application ne laisse pas une visite pointer vers une fiche disparue
         with VERROU_JOURNAL:
@@ -1233,17 +1241,19 @@ class Surveillance:
             ligne = self._ligne_visite(piste, cle, espece, score, source, manuelle, base_visite, photo, duree)
             ecrite = ajouter_ligne(self.dossier, ligne)
         if not ecrite:
-            self.sur_message("visites.csv est ouvert ailleurs : la visite attend d'y être écrite")
+            self.sur_message(t("visites.csv est ouvert ailleurs : la visite attend d'y être écrite"))
         if cle:
             try:
                 self._enrichir_galerie(piste, cle, nouvelle, base_visite, manuelle)
             except Exception as e:      # galerie pas enrichie cette fois : la visite, elle, est notée
-                self.sur_message(f"Galerie non enrichie : {type(e).__name__} : {e}")
+                self.sur_message(t("Galerie non enrichie : {type} : {erreur}", type=type(e).__name__, erreur=e))
         try:
             ecrire_positions(self.dossier, base_visite, piste)
         except OSError as e:            # positions perdues : la visite, elle, est notée
-            self.sur_message(f"Positions non écrites : {e}")
-        self.sur_message(f"Fin de visite : {ligne['individu']} ({ligne['espece']}), {duree:.0f} s")
+            self.sur_message(t("Positions non écrites : {erreur}", erreur=e))
+        individu = t(INCONNUE) if ligne["individu"] == INCONNUE else ligne["individu"]
+        self.sur_message(t("Fin de visite : {nom} ({espece}), {duree} s", nom=individu, duree=f"{duree:.0f}",
+                           espece=t(ligne["espece"]) if ligne["espece"] else ""))
         self.sur_visite(ligne)
         return ligne
 
@@ -1267,7 +1277,7 @@ class Surveillance:
         garder = {self.chemin_clip.name} if self.chemin_clip else set()
         n = nettoyer(self.dossier, self.menage_jours, self.menage_go, garder)
         if n:
-            self.sur_message(f"Ménage : anciens clips effacés : {n}")
+            self.sur_message(t("Ménage : anciens clips effacés : {n}", n=n))
 
     def _cadrer(self, image):
         if self.zone is None:
@@ -1293,7 +1303,7 @@ class Surveillance:
             return self.lecteur.file.get(timeout=1)
         except queue.Empty:
             if self.lecteur.en_lecture and time.time() - self.lecteur.derniere > self.SILENCE_MAX:
-                self.sur_message("Source figée : reconnexion…")
+                self.sur_message(t("Source figée : reconnexion…"))
                 self.lecteur.fin.set()      # son fil reste bloqué dans read() : on l'abandonne
                 self._lancer_lecteur(insister=True)
             elif not self.lecteur.is_alive() and not self.arret.is_set():
@@ -1321,9 +1331,9 @@ class Surveillance:
                 ouverte = self.lecteur.pret.is_set() and not self.lecteur.echec
             if not ouverte:
                 if not self.arret.is_set():
-                    self.sur_message(f"La source vidéo ne renvoie aucune image : {masquer(self.source)} (fenêtre fermée, "
-                                     "réduite ou cachée par une autre fenêtre, adresse fausse, caméra prise par une autre application, ou accès refusé "
-                                     "dans Paramètres › Confidentialité › Caméra)")
+                    self.sur_message(t("La source vidéo ne renvoie aucune image : {source} (fenêtre fermée, "
+                                       "réduite ou cachée par une autre fenêtre, adresse fausse, caméra prise par une autre application, ou accès refusé "
+                                       "dans Paramètres › Confidentialité › Caméra)", source=masquer(self.source)))
                 return False
             self._boucle(camera)
             return True
@@ -1389,8 +1399,8 @@ class Surveillance:
                     maintenant_figee = time.time() - t_change >= self.figee_s
                     if maintenant_figee != figee:
                         figee = maintenant_figee
-                        self.sur_message("Image figée depuis 1 min : le direct est sans doute arrêté" if figee
-                                         else "Image revenue : le direct tourne")
+                        self.sur_message(t("Image figée depuis 1 min : le direct est sans doute arrêté") if figee
+                                         else t("Image revenue : le direct tourne"))
                         self.sur_figee(figee)
                 mouvement = self._mouvement(fond, image)
                 intervalle = self.analyse_toutes if (self.pistes or mouvement) else self.veille_toutes
@@ -1412,7 +1422,7 @@ class Surveillance:
                     fps = fps_declare if self.fichier else self.lecteur.fps()
                     self._ouvrir_clip(fps, taille, tampon, instant)
                     if self.video is not None:
-                        self.sur_message("Tortue : début d'enregistrement")
+                        self.sur_message(t("Tortue : début d'enregistrement"))
                 for p in nouvelles:
                     p.clip = self.chemin_clip.name if self.video is not None else ""
                 if self.video is not None:
@@ -1464,7 +1474,7 @@ class Surveillance:
         try:
             self._analyser(image, instant)
         except Exception as e:      # une analyse ratée ne doit pas arrêter la surveillance
-            self.sur_message(f"Analyse impossible : {type(e).__name__} : {e}")
+            self.sur_message(t("Analyse impossible : {type} : {erreur}", type=type(e).__name__, erreur=e))
 
 
 # ------------------------------------------------------------------
@@ -1536,11 +1546,11 @@ def inscrire_photos(registre, detecteur, cle, chemins, sur_message=print):
     for chemin in chemins:
         image = lire_image(chemin)
         if image is None:
-            sur_message(f"Illisible : {Path(chemin).name}")
+            sur_message(t("Illisible : {fichier}", fichier=Path(chemin).name))
             continue
         d = detecteur.detecter(image)
         if not d:
-            sur_message(f"Pas de tortue trouvée : {Path(chemin).name}")
+            sur_message(t("Pas de tortue trouvée : {fichier}", fichier=Path(chemin).name))
             continue
         tortue = vision.isoler_tortue(image, max(d, key=lambda x: x[0])[1])
         if tortue is not None:
