@@ -23,11 +23,17 @@
 
 ## Install
 
-1. Install **Python 3.11** from python.org.
-2. Double-click `logiciel\installer.bat` once (about 5 GB on disk).
-3. Run `logiciel\Broutille.bat`. The vision models download on first launch (about 3 GB).
-4. **🐢 Add a tortoise**: name, species, 3–5 photos.
-5. Choose the camera (**📷 IP camera**, **🪟 Window**, webcam…), then **▶ Start**.
+**One click**: download [`Broutille-Setup.exe`](https://github.com/Oli97430/broutille/releases/latest/download/Broutille-Setup.exe) and double-click it.
+
+- No administrator rights needed. It installs Python 3.11 if missing, then the libraries (about 3 GB, 5 to 30 minutes); a black window shows the progress.
+- It adds **Broutille** to the Start menu (and the desktop if you tick the box), plus **Set up Broutille** to repair the libraries.
+- Windows may show "Windows protected your PC" because the installer is not signed: click *More info*, then *Run anyway*.
+- To update, run the new installer over the old one; downloaded libraries are kept. To uninstall: Windows Settings → Apps → Broutille. Your data is kept.
+
+Then:
+
+1. **🐢 Add a tortoise**: name, species, 3–5 photos.
+2. Choose the camera (**📷 IP camera**, **🪟 Window**, webcam…), then **▶ Start**.
 
 Mercusys / Tapo cameras need the **camera account** created in the maker's app (Device settings → Advanced settings → Camera account) — not your Mercusys login.
 

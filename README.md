@@ -64,15 +64,26 @@ Facultatif : [ffmpeg](https://ffmpeg.org) installé donne des clips verticaux en
 
 ## Démarrer
 
-1. Installer **Python 3.11** depuis python.org.
-2. Double-cliquer sur `logiciel/installer.bat`, une seule fois (environ 5 Go sur le disque).
-3. Double-cliquer sur `logiciel/Broutille.bat`. Le premier lancement télécharge les modèles (environ 3 Go).
-4. **🐢 Ajouter une tortue** pour chaque tortue : nom, espèce, puis 3 à 5 photos (face, deux profils, dessus).
-5. Choisir la caméra :
+**En un clic** : téléchargez [`Broutille-Setup.exe`](https://github.com/Oli97430/broutille/releases/latest/download/Broutille-Setup.exe) et double-cliquez dessus.
+
+- Aucun droit administrateur n'est demandé. L'installateur installe Python 3.11 s'il manque, puis les bibliothèques (environ 3 Go, 5 à 30 minutes selon la connexion) ; une fenêtre noire montre l'avancement.
+- Il ajoute **Broutille** au menu Démarrer (et au Bureau si vous cochez la case), avec **Préparer Broutille** pour réparer les bibliothèques en cas de problème.
+- Windows peut afficher « Windows a protégé votre ordinateur », car l'installateur n'est pas signé : cliquez *Informations complémentaires*, puis *Exécuter quand même*.
+- Mettre à jour : lancez le nouvel installateur par-dessus ; les bibliothèques déjà téléchargées sont gardées.
+- Désinstaller : Paramètres de Windows → Applications → Broutille. Vos visites, fiches et réglages (`Vidéos\Broutille`, `%USERPROFILE%\.broutille.json`) sont gardés.
+
+Les modèles de vision (environ 3 Go) se téléchargent au premier lancement.
+
+*Installation à la main, pour les développeurs* : Python 3.11, puis `logiciel\installer.bat` (ou `logiciel\preparer.ps1`), puis `logiciel\Broutille.bat`.
+
+Ensuite :
+
+1. **🐢 Ajouter une tortue** pour chaque tortue : nom, espèce, puis 3 à 5 photos (face, deux profils, dessus).
+2. Choisir la caméra :
    - caméra Wi-Fi : **📷 Caméra IP** → *Chercher sur le Wi-Fi* → identifiant du **compte de la caméra** → *Tester* → *Utiliser* ;
    - EZVIZ Studio ou autre lecteur : **🪟 Fenêtre**, puis **⛶ Cadrer** ;
    - une autre caméra en plus : **＋ Caméra** dans la ligne *Caméras*.
-6. **▶ Démarrer** (ou **▶▶ Démarrer toutes**).
+3. **▶ Démarrer** (ou **▶▶ Démarrer toutes**).
 
 **Caméra Mercusys ou Tapo** : créez d'abord le *compte de la caméra* dans l'appli du fabricant (Paramètres de l'appareil → Paramètres avancés → Compte de la caméra). Ce n'est pas votre compte Mercusys : avec l'adresse e-mail, la caméra refuse l'accès, et *Tester* le dit.
 
